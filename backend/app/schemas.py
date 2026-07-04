@@ -36,3 +36,26 @@ class CreateTaskResponse(BaseModel):
     """Response for POST /api/generate."""
     task_id: str
     status: str = "queued"
+
+
+# ─── Image generation models ───────────────────────────────────────
+
+
+class ImageMode(str, Enum):
+    """Image generation mode."""
+    txt2img = "txt2img"
+    img2img = "img2img"
+
+
+class ImageGenerateRequest(BaseModel):
+    """Request body for POST /api/image/generate."""
+    mode: ImageMode = ImageMode.txt2img
+    prompt: str = Field(..., min_length=1, max_length=2000, description="Image content description")
+    image: str | None = Field(None, description="Base64-encoded image (img2img mode only)")
+    size: str = Field("1024x1024", description="Output size: 1024x1024, 3840x2160, 2160x3840, 4096x4096")
+
+
+class ImageGenerateResponse(BaseModel):
+    """Response for POST /api/image/generate."""
+    image_url: str = Field(..., description="URL path to the generated image (/uploads/xxx.png)")
+    revised_prompt: str = Field("", description="Revised prompt from the API, if any")

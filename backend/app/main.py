@@ -3,9 +3,11 @@
 import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-from app.config import CORS_ORIGINS, BACKEND_PORT
+from app.config import CORS_ORIGINS, BACKEND_PORT, UPLOADS_DIR
 from app.api.video import router as video_router
+from app.api.image import router as image_router
 
 # Configure logging
 logging.basicConfig(
@@ -15,9 +17,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Agnes Video Generator MVP",
-    description="Video generation service powered by Agnes Video V2.0 API",
-    version="1.0.0",
+    title="Agnes AI Generator",
+    description="Video & image generation powered by Agnes AI APIs",
+    version="2.0.0",
 )
 
 # CORS: allow frontend dev server
@@ -31,6 +33,10 @@ app.add_middleware(
 
 # Register routes
 app.include_router(video_router)
+app.include_router(image_router)
+
+# Serve uploaded images as static files
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
 
 @app.get("/")

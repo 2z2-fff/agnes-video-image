@@ -25,3 +25,15 @@ Thumbs.db
 
 # Vite
 *.local
+
+# Generated uploads (images, videos)
+backend/uploads/
+
+# Accidental files
+frontend/=10.0.0
+
+# Generated uploads (images, videos)
+backend/uploads/
+
+# Accidental files
+frontend/=10.0.0

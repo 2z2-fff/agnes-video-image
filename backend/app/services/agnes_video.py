@@ -21,6 +21,7 @@ from app.config import (
     POLL_TIMEOUT_SEC,
 )
 from app.schemas import GenerateRequest, TaskResponse
+from app.services.agnes_image import _ensure_png_data_uri
 
 logger = logging.getLogger(__name__)
 
@@ -108,9 +109,25 @@ async def create_video_task(req: GenerateRequest) -> str:
         "frame_rate": req.fps,
     }
 
-    # img2vid: add image field (pure base64, no data URI prefix)
+    # img2vid: image MUST go in extra_body.image, NOT top-level body.
+    # The LiteLLM proxy strips unknown top-level parameters (like "image"),
+    # causing img2vid requests to fail with 404 NotFoundError.
+    # Fix: move image to extra_body.image (array of pure base64 strings).
+    # Diagnostic test (2026-07-03) confirmed: extra_body.image with pure base64 → 200 OK.
+    # The image is converted to PNG first (handles WebP/JPEG → PNG for format compatibility),
+    # then the data URI prefix is stripped to get pure base64.
     if req.mode == req.mode.img2vid and req.image:
-        body["image"] = _strip_data_uri(req.image)
+        # Step 1: Convert to PNG data URI (handles any format → PNG)
+        png_uri = _ensure_png_data_uri(req.image)
+        # Step 2: Strip data URI prefix → pure base64 (confirmed working format)
+        pure_b64 = _strip_data_uri(png_uri)
+        body["extra_body"] = {
+            "image": [pure_b64],  # array of pure base64 strings
+        }
+        logger.info(
+            "img2vid request: prompt=%s..., image_b64_len=%d, body_keys=%s",
+            req.prompt[:50], len(pure_b64), list(body.keys()),
+        )
 
     # Optional parameters (only add if non-empty/non-None)
     if req.negative_prompt:
@@ -121,13 +138,14 @@ async def create_video_task(req: GenerateRequest) -> str:
         body["num_inference_steps"] = req.num_inference_steps
 
     logger.info(
-        "Creating video task: mode=%s, prompt=%s..., %dx%d, %d frames @ %d fps",
+        "Creating video task: mode=%s, prompt=%s..., %dx%d, %d frames @ %d fps, has_extra_body=%s",
         req.mode,
         req.prompt[:50],
         width,
         height,
         num_frames,
         req.fps,
+        "extra_body" in body,
     )
 
     # Agnes API allows only 1 concurrent task. On 503 "Service busy", retry with backoff.
@@ -164,14 +182,27 @@ async def create_video_task(req: GenerateRequest) -> str:
                 error_detail = "Unknown error"
                 try:
                     err_data = resp.json()
-                    error_detail = (
-                        err_data.get("detail")
-                        or err_data.get("message")
-                        or str(err_data)
-                    )
+                    # LiteLLM returns errors nested as {"error": {"message": "...", "type": null, "param": null, "code": "404"}}
+                    # Try nested error.message first, then flat fields
+                    err_obj = err_data.get("error")
+                    if isinstance(err_obj, dict):
+                        error_detail = err_obj.get("message") or str(err_obj)
+                    else:
+                        error_detail = (
+                            err_data.get("detail")
+                            or err_data.get("message")
+                            or str(err_data)
+                        )
                 except Exception:
                     error_detail = resp.text[:500]
-                logger.error("Agnes API error %d: %s", resp.status_code, error_detail)
+                logger.error(
+                    "Agnes API error %d: %s | Full response body: %s | Request body keys: %s, has_extra_body: %s",
+                    resp.status_code,
+                    error_detail,
+                    resp.text[:500],
+                    list(body.keys()),
+                    "extra_body" in body,
+                )
                 raise HTTPException(
                     status_code=resp.status_code,
                     detail=f"Agnes API error: {error_detail}",
@@ -181,6 +212,12 @@ async def create_video_task(req: GenerateRequest) -> str:
             break
 
     data = resp.json()
+    logger.info(
+        "API response: status_code=%d, response_keys=%s, body_keys=%s",
+        resp.status_code,
+        list(data.keys()),
+        list(body.keys()),
+    )
     task_id = _extract_task_id(data)
     logger.info("Task created: %s", task_id)
     return task_id
@@ -207,8 +244,27 @@ async def query_task_status(task_id: str) -> TaskResponse:
     data = resp.json()
     status = data.get("status", "unknown")
 
-    # Extract video URL (Agnes stores it in remixed_from_video_id, not video_url)
-    video_url = data.get("remixed_from_video_id") or data.get("video_url")
+    # Diagnostic: log all response keys when completed, to find the video URL field
+    if status == "completed":
+        logger.info("Task completed. Response keys: %s", list(data.keys()))
+        # Log all non-None values that could be URLs
+        for k, v in data.items():
+            if v is not None and isinstance(v, str) and (v.startswith("http") or "url" in k.lower() or "video" in k.lower()):
+                logger.info("  Field '%s' = %s", k, v[:120])
+
+    # Extract video URL — check multiple possible field names
+    video_url = (
+        data.get("remixed_from_video_id")
+        or data.get("video_url")
+        or data.get("url")
+        or data.get("output_url")
+        or data.get("result_url")
+        or data.get("download_url")
+    )
+
+    # If still None and status is completed, log the full response for debugging
+    if status == "completed" and not video_url:
+        logger.warning("Task completed but no video URL found! Full response: %s", str(data)[:1000])
 
     # Extract duration
     duration = None
