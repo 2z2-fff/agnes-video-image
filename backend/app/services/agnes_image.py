@@ -19,6 +19,7 @@ from app.config import (
     IMAGE_CREATE_URL,
     IMAGE_MODEL,
     IMAGE_RATE_LIMIT_COOLD,
+    IMAGE_SERVICE_UNAVAIL_COOLD,
     IMAGE_MAX_RETRIES,
     IMAGE_NETWORK_RETRY_DELAYS,
     UPLOADS_DIR,
@@ -215,6 +216,23 @@ async def _call_image_api(req: ImageGenerateRequest) -> dict:
                     detail="图片生成 API 限流（4K 档每分钟仅允许 1 次请求），已自动重试 3 次仍被限流，请等待 1 分钟后重试",
                 )
 
+            # 503 = service unavailable (queue full) → wait and retry
+            if resp.status_code == 503:
+                if attempt < max_retries:
+                    wait = IMAGE_SERVICE_UNAVAIL_COOLD
+                    logger.warning(
+                        "Agnes Image API unavailable (503), retry %d/%d after %.0fs...",
+                        attempt + 1,
+                        max_retries,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise HTTPException(
+                    status_code=503,
+                    detail="图片生成服务暂时不可用，已自动重试 3 次仍失败，请稍后重试",
+                )
+
             # Other non-200 errors
             if resp.status_code != 200:
                 error_detail = "Unknown error"
@@ -255,7 +273,7 @@ async def _call_image_api(req: ImageGenerateRequest) -> dict:
 
         except HTTPException:
             raise
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+        except (httpx.ConnectError, httpx.ReadError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
             last_error = e
             if attempt < max_retries and attempt < len(network_delays):
                 delay = network_delays[attempt]

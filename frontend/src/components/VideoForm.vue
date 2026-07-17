@@ -2,6 +2,7 @@
 import { ref } from "vue";
 import { useVideoStore } from "../stores/videoStore";
 import type { AspectRatio, GenerateMode } from "../api/video";
+import PromptEngineer from "./PromptEngineer.vue";
 
 const store = useVideoStore();
 
@@ -102,6 +103,9 @@ function canGenerate(): boolean {
         maxlength="2000"
       ></textarea>
     </div>
+
+    <!-- Prompt Engineering -->
+    <PromptEngineer mode="video" @apply="store.prompt = $event" />
 
     <!-- Aspect Ratio -->
     <div class="form-section">

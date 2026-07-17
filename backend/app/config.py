@@ -48,6 +48,7 @@ IMAGE_SIZE_MAP: dict[str, str] = {
 
 # 4K tier rate limit: 1 request per 60 seconds
 IMAGE_RATE_LIMIT_COOLD = 65.0
+IMAGE_SERVICE_UNAVAIL_COOLD = 15.0  # seconds — queue full clears faster than rate limit
 IMAGE_MAX_RETRIES = 3
 IMAGE_NETWORK_RETRY_DELAYS = [10, 20, 30]  # seconds
 

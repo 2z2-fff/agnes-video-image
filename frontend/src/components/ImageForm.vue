@@ -2,6 +2,7 @@
 import { ref } from "vue";
 import { useImageStore } from "../stores/imageStore";
 import type { ImageMode, ImageSize } from "../api/image";
+import PromptEngineer from "./PromptEngineer.vue";
 
 const store = useImageStore();
 
@@ -104,6 +105,9 @@ function canGenerate(): boolean {
         maxlength="2000"
       ></textarea>
     </div>
+
+    <!-- Prompt Engineering -->
+    <PromptEngineer mode="image" @apply="store.prompt = $event" />
 
     <!-- Size Selection -->
     <div class="form-section">
