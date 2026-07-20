@@ -28,8 +28,10 @@ export const useImageStore = defineStore("image", () => {
   const isFailed = computed(() => taskStatus.value === "failed");
 
   // ─── Actions ─────────────────────────────────
+
   function setMode(newMode: ImageMode) {
     mode.value = newMode;
+    // Clear image data only when switching to txt2img (no image needed)
     if (newMode === "txt2img") {
       imagePreview.value = null;
       imageBase64.value = null;
@@ -57,7 +59,7 @@ export const useImageStore = defineStore("image", () => {
       error.value = "请输入图片提示词";
       return;
     }
-    if (mode.value === "img2img" && !imageBase64.value) {
+    if ((mode.value === "img2img" || mode.value === "cartoon") && !imageBase64.value) {
       error.value = "请上传一张参考图片";
       return;
     }
@@ -79,7 +81,7 @@ export const useImageStore = defineStore("image", () => {
       const result = await generateImage({
         mode: mode.value,
         prompt: prompt.value,
-        image: mode.value === "img2img" ? imageBase64.value : null,
+        image: (mode.value === "img2img" || mode.value === "cartoon") ? imageBase64.value : null,
         size: size.value,
       });
 

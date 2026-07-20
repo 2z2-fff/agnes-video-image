@@ -117,6 +117,71 @@ export const videoExtraDimensions: DimensionConfig[] = [
   { key: "camera", label: "镜头运动", type: "select", presets: cameraPresets },
 ];
 
+// ─── Cartoon presets (9) ──────────────────────────────────────────
+
+export interface CartoonPreset {
+  label: string;
+  value: string;
+  /** Short description displayed on the preset card */
+  description: string;
+}
+
+export const cartoonPresets: CartoonPreset[] = [
+  {
+    label: "Q版贴纸+自定义表情",
+    description: "生成四个表情贴纸：生气、嘟嘴、疑惑、发怒",
+    value:
+      "引用上面的图片人物造型，生成一套Q版贴纸，要有厚白边，必须要透明背景，生成四个表情图片，这四个表情分别是：生气，嘟嘴，疑惑，发怒。",
+  },
+  {
+    label: "史努比风格",
+    description: "史努比漫画风格贴纸头像",
+    value:
+      "学习史努比漫画风格，将照片中的人生成为此风格的贴纸头像。模仿形体，脸型，肤色、五官表情。图中人物面部装饰，发型以及发饰，服装，配饰、表情、姿势保持一致。背景白底，只要完整人物，确保最终图像看起来像史努比漫画风格的人物。",
+  },
+  {
+    label: "皮克斯风格",
+    description: "Pixar animation style",
+    value: "Pixar animation style",
+  },
+  {
+    label: "卡通头像",
+    description: "圆角方形头像框，手绘粗线稿",
+    value:
+      "参考照片生成卡通头像，圆角方形头像框，白色贴纸描边，半身胸像，正面像，手绘粗线稿（深灰/黑），极简配色，空白底色，轻水彩上色与蜡笔/粉笔纹理，纸张颗粒噪点，干净留白，少量元素突破边框标志性元素/特效，可爱明快表情，柔和内阴影或投影，画面整洁、无复杂背景。",
+  },
+  {
+    label: "卡通正面全身像",
+    description: "1.5头身Q版萌系卡通比例，手绘插画风格",
+    value:
+      "将该人物改为卡通正面全身像，1.5头身的 Q 版萌系卡通比例，让身体宽度比头略宽。手绘插画风格，干净流畅的黑色轮廓线，平涂色彩，柔和渐变阴影，暖色调配色，温馨治愈的学院风。保留真人面部核心特征（眼镜、发型、脸型、五官比例，表情），亲切专业的神态，全身站立构图，保持照片中服饰，纯白色免扣背景，无多余装饰，突出人物主体，人物比例协调，五官可爱不失写实感，风格类似卡通群像。",
+  },
+  {
+    label: "萌风Q版角色·涂鸦",
+    description: "凌乱黑色线稿，粗笔触水粉蜡笔质感",
+    value:
+      "一个萌风Q版角色，凌乱粗糙的黑色线稿，幼态比例，像小孩随手涂鸦但极具设计感，粗笔触、水粉厚涂、蜡笔质感，边缘随意外扩，留白背景、可爱、手绘感极强，不精致，故意画歪，松散构图，低饱和奶油色调，艺术涂鸦插画",
+  },
+  {
+    label: "Chibi风格",
+    description: "Chibi画风表情包，白底完整人物",
+    value:
+      "将图片生成 chibi 画风表情包，背景白底，只要完整人物，互不遮挡，确保最终图像看起来是chibi风格的人物。",
+  },
+  {
+    label: "猪猪boy/girl",
+    description: "儿童蜡笔涂鸦插画，Q版萌系二次元，可爱混乱风",
+    value:
+      "把上传照片转化成一种可爱混乱的儿童蜡笔涂鸦插画风格。整体像是彩铅+蜡笔+手账贴纸+MS Paint涂鸦的结合。使用：粗糙线条，抖动边缘，不均匀上色，纸张纹理，彩铅叠色，蜡笔颗粒感，故意幼稚但很有灵气的画风。人物变成Q版萌系二次元风格，大眼睛，夸张表情，可爱活泼。背景加入大量doodle：爱心，星星，糖果，笑脸云朵，小花，贴纸，游戏U元素，乱涂乱画符号。颜色以：粉色，蓝色，紫色，黄色，薄荷色为主。整体氛围：可爱，混乱，梦幻，少女感，游戏宅手账风，互联网kawaii, Kawaiaesthetic不要精致，不要高级商业插画感，不要真实渲染，不要干净线稿，保留手绘失败感和乱涂鸦感",
+  },
+  {
+    label: "像素风格",
+    description: "Everskies像素画风贴纸头像",
+    value:
+      "学习everskies像素画风，将照片中的人生成为此风格的贴纸头像。模仿形体，脸部，五官表情，服饰和发型的画法。用附件图中人物的发型，衣服和配饰画一张人物插图，背景白底，只要完整人物，确保最终图像看起来像像素风格的人物。",
+  },
+];
+
 /** Get all dimensions for a given mode */
 export function getDimensions(mode: "image" | "video"): DimensionConfig[] {
   if (mode === "video") {

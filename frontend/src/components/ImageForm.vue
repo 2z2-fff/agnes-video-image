@@ -1,12 +1,21 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import { useImageStore } from "../stores/imageStore";
 import type { ImageMode, ImageSize } from "../api/image";
 import PromptEngineer from "./PromptEngineer.vue";
+import { cartoonPresets } from "../data/promptPresets";
 
 const store = useImageStore();
 
 const dragOver = ref(false);
+const selectedCartoonPreset = ref(-1);
+
+// Clear cartoon preset highlight when switching away from cartoon mode
+watch(() => store.mode, (newMode) => {
+  if (newMode !== "cartoon") {
+    selectedCartoonPreset.value = -1;
+  }
+});
 
 const sizeOptions: { label: string; value: ImageSize }[] = [
   { label: "标准 1:1", value: "1024x1024" },
@@ -18,6 +27,7 @@ const sizeOptions: { label: string; value: ImageSize }[] = [
 const modeTabs: { label: string; value: ImageMode }[] = [
   { label: "文生图", value: "txt2img" },
   { label: "图生图", value: "img2img" },
+  { label: "卡通图像生成", value: "cartoon" },
 ];
 
 function onDrop(e: DragEvent) {
@@ -36,9 +46,14 @@ function onFileSelect(e: Event) {
   }
 }
 
+function selectCartoonPreset(index: number) {
+  selectedCartoonPreset.value = index;
+  store.prompt = cartoonPresets[index].value;
+}
+
 function canGenerate(): boolean {
   if (!store.prompt.trim()) return false;
-  if (store.mode === "img2img" && !store.imageBase64) return false;
+  if ((store.mode === "img2img" || store.mode === "cartoon") && !store.imageBase64) return false;
   return !store.isProcessing;
 }
 </script>
@@ -57,8 +72,8 @@ function canGenerate(): boolean {
       </button>
     </div>
 
-    <!-- Image Upload (img2img only) -->
-    <div v-if="store.mode === 'img2img'" class="form-section">
+    <!-- Image Upload (img2img & cartoon) -->
+    <div v-if="store.mode === 'img2img' || store.mode === 'cartoon'" class="form-section">
       <label class="form-label">参考图片</label>
       <div
         v-if="!store.imagePreview"
@@ -86,19 +101,42 @@ function canGenerate(): boolean {
       </div>
     </div>
 
+    <!-- Cartoon Preset Selection -->
+    <div v-if="store.mode === 'cartoon'" class="form-section">
+      <label class="form-label">选择预设风格</label>
+      <div class="cartoon-presets">
+        <button
+          v-for="(preset, i) in cartoonPresets"
+          :key="i"
+          :class="['cartoon-preset-card', { active: selectedCartoonPreset === i }]"
+          @click="selectCartoonPreset(i)"
+        >
+          <span class="preset-name">{{ preset.label }}</span>
+          <span class="preset-desc">{{ preset.description }}</span>
+        </button>
+      </div>
+    </div>
+
     <!-- Prompt Input -->
     <div class="form-section">
       <label class="form-label">
         图片提示词
         <span class="char-count">{{ store.prompt.length }} / 2000</span>
       </label>
-      <div v-if="store.mode === 'img2img'" class="prompt-hint">
-        图生图提示：请明确描述要保留的原图要素和要修改的部分。例如「保留原图的构图和人物姿势，将场景改为赛博朋克风格，添加霓虹灯光」
+      <div v-if="store.mode === 'img2img' || store.mode === 'cartoon'" class="prompt-hint">
+        <template v-if="store.mode === 'cartoon'">
+          卡通图像生成提示：请先上传人物照片，然后选择预设风格，提示词会自动填充。你也可以手动调整提示词以获得更好的效果。
+        </template>
+        <template v-else>
+          图生图提示：请明确描述要保留的原图要素和要修改的部分。例如「保留原图的构图和人物姿势，将场景改为赛博朋克风格，添加霓虹灯光」
+        </template>
       </div>
       <textarea
         v-model="store.prompt"
         class="prompt-input"
-        :placeholder="store.mode === 'img2img'
+        :placeholder="store.mode === 'cartoon'
+          ? '选择预设风格后自动填充提示词，你也可以手动调整...'
+          : store.mode === 'img2img'
           ? '例如：保留原图的构图和主体，将场景改为雨夜赛博朋克风格，添加霓虹灯光反射'
           : '描述你想要生成的图片，例如：一只金色的猫坐在窗台上，阳光洒落，温暖的光影，高清细节，电影级构图'"
         rows="4"
@@ -389,5 +427,49 @@ function canGenerate(): boolean {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* Cartoon preset cards */
+.cartoon-presets {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.cartoon-preset-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  text-align: left;
+  transition: all 0.2s;
+  cursor: pointer;
+}
+
+.cartoon-preset-card:hover {
+  border-color: var(--primary);
+  background: var(--primary-bg);
+}
+
+.cartoon-preset-card.active {
+  border-color: var(--primary);
+  background: var(--primary-bg);
+  box-shadow: 0 0 0 1px var(--primary);
+}
+
+.preset-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.3;
+}
+
+.preset-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.4;
 }
 </style>

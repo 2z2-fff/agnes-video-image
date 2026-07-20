@@ -2,7 +2,7 @@ import api from "./index";
 
 // ─── Types ─────────────────────────────────────────
 
-export type ImageMode = "txt2img" | "img2img";
+export type ImageMode = "txt2img" | "img2img" | "cartoon";
 export type ImageSize = "1024x1024" | "3840x2160" | "2160x3840" | "4096x4096";
 export type ImageTaskStatus = "idle" | "processing" | "complete" | "failed";
 

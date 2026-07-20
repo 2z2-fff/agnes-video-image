@@ -172,14 +172,14 @@ async def _call_image_api(req: ImageGenerateRequest) -> dict:
     # causing the API to fall back to text2img. extra_body is the correct channel
     # for non-standard parameters. Verified by diagnostic: extra_body.image → /i2i/ URL,
     # top-level image → /t2i/ URL (silent fallback).
-    if req.mode == req.mode.img2img and req.image:
+    if req.mode in (req.mode.img2img, req.mode.cartoon) and req.image:
         png_uri = _ensure_png_data_uri(req.image)
         body["extra_body"] = {
             "image": [png_uri],
             "response_format": "url",
         }
         logger.info(
-            "img2img request: prompt=%s..., size=%s, image_data_uri_len=%d, body_keys=%s",
+            "img2img/cartoon request: prompt=%s..., size=%s, image_data_uri_len=%d, body_keys=%s",
             req.prompt[:50], req.size, len(png_uri), list(body.keys()),
         )
     else:

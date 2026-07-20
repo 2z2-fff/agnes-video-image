@@ -45,6 +45,7 @@ class ImageMode(str, Enum):
     """Image generation mode."""
     txt2img = "txt2img"
     img2img = "img2img"
+    cartoon = "cartoon"
 
 
 class ImageGenerateRequest(BaseModel):
