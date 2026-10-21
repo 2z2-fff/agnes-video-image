@@ -30,6 +30,7 @@ from app.config import (
     POLL_INTERVAL_SEC,
     POLL_TIMEOUT_SEC,
     QUERY_VIDEO_URL,
+    QUEUE_WAIT_MINUTES,
     REF_IMAGE_MAX_SIDE,
     REF_TOTAL_MAX_MB,
     VIDEO_DIR,
@@ -43,12 +44,12 @@ from app.services.agnes_image import _ensure_png_data_uri
 logger = logging.getLogger(__name__)
 
 # Queue-full handling: the video service allows a single concurrent task and
-# answers new requests with HTTP 503 / code "video_queue_full". Observed waits
-# of up to ~7 minutes, and the queue can stay saturated for hours, so the
-# background retry budget is deliberately long — it no longer blocks any HTTP
-# request (the client polls /api/jobs/{id} instead).
-QUEUE_RETRY_ATTEMPTS = 120          # 120 × 15s = 30 minutes
-QUEUE_RETRY_DELAY_SEC = 15
+# answers new requests with HTTP 503 / code "video_queue_full". The queue is
+# shared platform-wide and can stay saturated for hours (verified: none of our
+# own tasks were holding it), so the background retries with escalating delays
+# within a configurable budget instead of blocking any HTTP request.
+QUEUE_WAIT_SEC = QUEUE_WAIT_MINUTES * 60
+QUEUE_RETRY_DELAYS = [15, 30, 60]   # escalate to stop hammering the endpoint
 
 # Status-query transport retries (the API sometimes drops the connection
 # mid-poll without returning a response).
@@ -228,15 +229,18 @@ def _extract_error_message(resp: httpx.Response) -> tuple[str, str]:
 
 async def create_video_task(
     req: GenerateRequest,
-    max_attempts: int = QUEUE_RETRY_ATTEMPTS,
+    max_attempts: int = 1,
     record_id: str | None = None,
 ) -> dict:
     """Submit a video task. Returns task metadata including the polling ID.
 
     ``max_attempts=0`` performs a single non-blocking attempt: if the shared
     queue is full it raises 503 immediately so the HTTP request can return and
-    the retrying can continue in the background (a 10-minute blocked request
-    always loses the race against a client timeout, orphaning the task).
+    the retrying can continue in the background (a long blocked request always
+    loses the race against a client timeout, orphaning the task).
+
+    ``max_attempts>=1`` retries within ``QUEUE_WAIT_MINUTES`` with escalating
+    delays — that is what the background worker uses.
 
     ``record_id`` reuses an existing history record instead of creating one.
     """
@@ -250,7 +254,10 @@ async def create_video_task(
     )
 
     async with _no_proxy_client(timeout=180) as client:
-        for attempt in range(max_attempts + 1):
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            attempt += 1
             resp = await client.post(CREATE_VIDEO_URL, headers=_get_headers(), json=body)
 
             if resp.status_code == 200:
@@ -287,26 +294,28 @@ async def create_video_task(
 
             code, message = _extract_error_message(resp)
 
-            # 503 / video_queue_full → the queue is busy; wait and retry.
+            # 503 / video_queue_full → the queue is busy; retry within budget.
             if resp.status_code == 503 or code == "video_queue_full":
-                if attempt < max_attempts:
-                    logger.warning(
-                        "Video queue full (attempt %d/%d), retry in %ds",
-                        attempt + 1, max_attempts, QUEUE_RETRY_DELAY_SEC,
+                elapsed = time.monotonic() - started
+                if max_attempts == 0 or elapsed >= QUEUE_WAIT_SEC:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Agnes 视频队列已满（平台共享，同一时间仅允许 1 个任务），"
+                            f"已排队等待约 {int(elapsed // 60)} 分钟仍未空闲"
+                            f"（上限 {QUEUE_WAIT_MINUTES} 分钟）；本次未创建任务、未计费，请稍后重试"
+                        ),
                     )
-                    await asyncio.sleep(QUEUE_RETRY_DELAY_SEC)
-                    continue
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Agnes 视频队列已满（同一时间仅允许 1 个任务），"
-                        f"已排队等待约 {QUEUE_RETRY_ATTEMPTS * QUEUE_RETRY_DELAY_SEC // 60} 分钟仍未空闲；"
-                        "本次未创建任务、未计费，请稍后重试"
-                    ),
+                delay = QUEUE_RETRY_DELAYS[min(attempt - 1, len(QUEUE_RETRY_DELAYS) - 1)]
+                logger.warning(
+                    "Video queue full (attempt %d, waited %ds), retry in %ds",
+                    attempt, int(elapsed), delay,
                 )
+                await asyncio.sleep(delay)
+                continue
 
             # 429 → back off once and retry
-            if resp.status_code == 429 and attempt < QUEUE_RETRY_ATTEMPTS:
+            if resp.status_code == 429:
                 await asyncio.sleep(30)
                 continue
 
@@ -324,16 +333,18 @@ async def create_video_task(
 
 # ─── Background submission (queue-full path) ──────────────────────
 
-# Keep strong references so the event loop does not garbage-collect the tasks.
-_submit_jobs: set[asyncio.Task] = set()
+# record_id -> task, so the user can cancel a queue wait and we can keep a
+# strong reference (the event loop would otherwise garbage-collect it).
+_submit_jobs: dict[str, asyncio.Task] = {}
 
 
 async def _submit_worker(record_id: str, req: GenerateRequest) -> None:
     """Retry submitting until accepted, then attach the Agnes task id."""
     try:
-        await create_video_task(
-            req, max_attempts=QUEUE_RETRY_ATTEMPTS, record_id=record_id
-        )
+        await create_video_task(req, max_attempts=1, record_id=record_id)
+    except asyncio.CancelledError:
+        logger.info("Background submit cancelled (record %s)", record_id)
+        raise
     except HTTPException as exc:
         logger.warning("Background submit failed (record %s): %s", record_id, exc.detail)
         history.update_record(record_id=record_id, status="failed", error=str(exc.detail))
@@ -345,8 +356,21 @@ async def _submit_worker(record_id: str, req: GenerateRequest) -> None:
 def spawn_submit(record_id: str, req: GenerateRequest) -> None:
     """Start a background submit retry loop for a queued generation."""
     task = asyncio.create_task(_submit_worker(record_id, req))
-    _submit_jobs.add(task)
-    task.add_done_callback(_submit_jobs.discard)
+    _submit_jobs[record_id] = task
+
+    def _cleanup(_: asyncio.Task) -> None:
+        _submit_jobs.pop(record_id, None)
+
+    task.add_done_callback(_cleanup)
+
+
+def cancel_submit(record_id: str) -> bool:
+    """Stop a queued (not yet submitted) job. Returns True if one was running."""
+    task = _submit_jobs.pop(record_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+        return True
+    return False
 
 
 async def _persist_video_file(video_id: str, remote_url: str) -> str | None:

@@ -654,3 +654,98 @@ RESULT: PASS
 
 配合 10.6 的回归测试，202 链路的每个环节（返回 job → 后台提交 → 回填 task_id → 轮询 → 落盘）都已覆盖。
 
+---
+
+## 十一、分析：`排队超时，任务未能提交（未创建任务、未计费）`（v2.3.3）
+
+### 11.1 这条文案从哪来
+
+它不是后端返回的，而是**前端 `videoStore` 的兜底文案**：
+
+```ts
+error.value = job?.error || "排队超时，任务未能提交（未创建任务、未计费）";
+```
+
+走默认值说明 `job` 为空或 `job.error` 为空 → **客户端自己等不住了**，而不是后端判了失败。
+查代码：`waitForJobTaskId(created.job_id, 900000, ...)` —— 硬编码 **15 分钟**，
+而后端排队预算是 **30 分钟**。
+
+**这和第 9 节的 330s/450s 是同一类错误，我在"轮询层"又犯了一次。**
+后果同样严重：客户端 15 分钟放弃后，后端仍会继续重试到 30 分钟，一旦成功就会
+再产生一个**孤儿任务**（界面上看不到、可能计费）。
+
+### 11.2 队列为什么一直满
+
+排查结论（`scripts/probe_queue_state.py`）：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 当前提交错误码 | `video_queue_full`（确认是队列满，不是参数错） |
+| 是否有任务列表接口 | ❌ `GET /v1/videos` → 404 |
+| 是否能取消远程任务 | ❌ 无此接口 |
+| 我方历史任务是否占着并发位 | ❌ 4 个任务全部 `completed` |
+| 状态查询是否有限流 | ✅ 会返回 `429 too many video status queries` |
+
+结论：**队列是平台级共享资源，被其他用户长期占满**，与我们自己的任务无关。
+既然没有任务列表/取消接口，除了等待，唯一可控的就是"等到什么时候"。
+
+### 11.3 修复
+
+**① 消灭硬编码：让前端从后端读取预算（单一事实源）**
+
+```text
+GET /api/config → video.queue_wait_minutes = 30
+前端轮询窗口 = (queue_wait_minutes + 5) 分钟
+```
+
+这样 `QUEUE_WAIT_MINUTES` 改一次，前后端一起变，不会再各自漂移。
+
+**② 排队预算可配置 + 退避递增**
+
+| 项 | 改前 | 改后 |
+| --- | --- | --- |
+| 预算 | 120 次 × 15s（写死 30 分钟） | `QUEUE_WAIT_MINUTES`（默认 30，可配） |
+| 重试间隔 | 固定 15s | **15s → 30s → 60s** 递增 |
+| 失败文案 | 固定"30 分钟" | 实际已等待分钟数 + "未创建任务、未计费" |
+
+退避实测日志：
+
+```text
+Video queue full (attempt 1, waited 1s),  retry in 15s
+Video queue full (attempt 2, waited 19s), retry in 30s
+Video queue full (attempt 3, waited 53s), retry in 60s
+```
+
+**③ 新增"取消排队"** —— 用户不必被动等满 30 分钟
+
+```text
+POST /api/jobs/{job_id}/cancel
+→ {"job_id":"98deb82daefa","status":"cancelled","worker_stopped":true}
+```
+
+UI 在"正在提交任务..."状态下显示「取消排队」按钮；取消后明确提示未创建任务、未计费。
+（任务一旦提交到 Agnes 就无法取消——公开 API 没有这个能力，接口会明确拒绝。）
+
+### 11.4 验证
+
+```text
+# 配置暴露预算
+GET /api/config → ..., "queue_wait_minutes":30
+
+# 取消排队（worker 确实被停掉）
+POST /api/jobs/98deb82daefa/cancel → {"status":"cancelled","worker_stopped":true}
+GET  /api/jobs/98deb82daefa → status=cancelled, error="已取消排队（未创建任务、未计费）"
+
+# 退避递增（后端日志，见 11.3）
+
+# 前端
+vue-tsc --noEmit 通过
+```
+
+### 11.5 说明
+
+- 队列满属于**平台容量问题**，30 分钟已是合理的等待上限；继续等只会让用户误以为卡死。
+- 如果你的使用场景经常撞上满队列，可以把 `QUEUE_WAIT_MINUTES` 调大（例如 120），
+  界面会一直显示已等待时长，且随时可以取消。
+- 想彻底避免排队，只能在平台队列空闲时段提交，或改用其他供应商——这是外部依赖，不是本项目能修的。
+

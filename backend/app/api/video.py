@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/generate", tags=["video"])
 jobs_router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
-TERMINAL = {"completed", "failed", "timeout"}
+TERMINAL = {"completed", "failed", "timeout", "cancelled"}
 
 
 @router.post("", response_model=CreateTaskResponse)
@@ -91,6 +91,32 @@ async def create_task(req: GenerateRequest):
             "message": f"{message}；可用 job_id 查询进度",
         },
     )
+
+
+@jobs_router.post("/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Cancel a job that is still waiting for queue capacity.
+
+    Only the local queue wait can be cancelled — once a task exists on Agnes
+    there is no cancel endpoint in the public API.
+    """
+    record = history.get_record(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="没有该任务记录")
+    if record.get("task_id"):
+        raise HTTPException(
+            status_code=400,
+            detail="任务已提交到 Agnes，无法取消；可在“最近生成”中查看结果",
+        )
+
+    stopped = agnes_video.cancel_submit(job_id)
+    history.update_record(
+        record_id=job_id,
+        status="cancelled",
+        error="已取消排队（未创建任务、未计费）",
+    )
+    logger.info("Job %s cancelled by user (worker stopped=%s)", job_id, stopped)
+    return {"job_id": job_id, "status": "cancelled", "worker_stopped": stopped}
 
 
 @jobs_router.get("/{job_id}", response_model=JobResponse)

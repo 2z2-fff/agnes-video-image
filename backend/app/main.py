@@ -14,6 +14,7 @@ from app.config import (
     IMAGE_RATIOS,
     IMAGE_SIZE_LABELS,
     IMAGE_SIZES,
+    QUEUE_WAIT_MINUTES,
     UPLOADS_DIR,
     VIDEO_ASPECT_RATIOS,
     VIDEO_MAX_SECONDS,
@@ -90,6 +91,9 @@ async def config():
             "supports_last_frame": True,
             # mode="reference" image cap for the active model
             "max_reference_images": max_reference_images(),
+            # how long the backend keeps retrying a full shared queue; the
+            # frontend derives its polling window from this (never hardcode it)
+            "queue_wait_minutes": QUEUE_WAIT_MINUTES,
         },
         "image": {
             "model": IMAGE_MODEL,

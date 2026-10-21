@@ -52,6 +52,11 @@ REF_TOTAL_MAX_MB = int(os.getenv("REF_TOTAL_MAX_MB", "45"))  # API limit is 50MB
 # timeout; anything slower is handed to the background job instead.
 FAST_SUBMIT_TIMEOUT_SEC = float(os.getenv("FAST_SUBMIT_TIMEOUT_SEC", "20"))
 
+# How long the background keeps retrying a full video queue. The queue is
+# shared platform-wide and has stayed saturated for hours, so this is
+# configurable; the frontend derives its own polling window from /api/config.
+QUEUE_WAIT_MINUTES = int(os.getenv("QUEUE_WAIT_MINUTES", "30"))
+
 # A job still "submitting" after this long is considered dead (the background
 # task does not survive a process restart), so the UI stops polling forever.
 SUBMIT_STALE_SEC = int(os.getenv("SUBMIT_STALE_SEC", "2400"))

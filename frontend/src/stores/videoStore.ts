@@ -7,6 +7,7 @@ import {
   getAppConfig,
   waitForTask,
   waitForJobTaskId,
+  cancelJob,
   type AspectRatio,
   type GenerateMode,
   type TaskStatus,
@@ -74,6 +75,10 @@ export const useVideoStore = defineStore("video", () => {
   const maxSeconds = ref(12);
   const supportsLastFrame = ref(true);
   const maxReferenceImages = ref(8);
+  // Mirrors the backend's queue budget; the polling window is derived from it
+  // so the two can never drift apart again.
+  const queueWaitMinutes = ref(30);
+  const cancelRequested = ref(false);
 
   // ─── Task state ───────────────────────────────
   const taskStatus = ref<TaskStatus>("idle");
@@ -113,6 +118,7 @@ export const useVideoStore = defineStore("video", () => {
       maxSeconds.value = cfg.video.max_seconds;
       supportsLastFrame.value = cfg.video.supports_last_frame ?? true;
       maxReferenceImages.value = cfg.video.max_reference_images ?? 8;
+      queueWaitMinutes.value = cfg.video.queue_wait_minutes ?? 30;
 
       if (!cfg.video.sizes.includes(size.value)) {
         size.value = cfg.video.sizes[0];
@@ -198,6 +204,25 @@ export const useVideoStore = defineStore("video", () => {
     referenceImages.value.splice(index, 1);
   }
 
+  /** Client polling window: always wider than the backend's queue budget. */
+  function jobWaitMs(): number {
+    return (queueWaitMinutes.value + 5) * 60_000;
+  }
+
+  /** User-initiated cancel while the job is still waiting for queue capacity. */
+  async function cancelQueue() {
+    if (!jobId.value) return;
+    cancelRequested.value = true;
+    try {
+      await cancelJob(jobId.value);
+    } catch {
+      // The worker may have already submitted; the job record still tells the truth.
+    }
+    taskStatus.value = "failed";
+    error.value = "已取消排队（未创建任务、未计费）";
+    persist();
+  }
+
   async function generate() {
     if (!prompt.value.trim()) {
       error.value = "请输入视频提示词";
@@ -254,16 +279,26 @@ export const useVideoStore = defineStore("video", () => {
       if (!agnesTaskId && created.job_id) {
         jobId.value = created.job_id;
         taskStatus.value = "queued";
+        cancelRequested.value = false;
         persist();
 
-        const job = await waitForJobTaskId(created.job_id, 900000, (tick) => {
-          if (tick.progress != null) progress.value = tick.progress;
-          taskStatus.value = tick.task_id ? "in_progress" : "queued";
-        });
+        const job = await waitForJobTaskId(
+          created.job_id,
+          jobWaitMs(),
+          (tick) => {
+            if (tick.progress != null) progress.value = tick.progress;
+            taskStatus.value = tick.task_id ? "in_progress" : "queued";
+          },
+          () => cancelRequested.value
+        );
 
         if (!job?.task_id) {
-          taskStatus.value = job?.status === "timeout" ? "timeout" : "failed";
-          error.value = job?.error || "排队超时，任务未能提交（未创建任务、未计费）";
+          taskStatus.value = job?.status === "cancelled" ? "failed" : job?.status === "timeout" ? "timeout" : "failed";
+          error.value =
+            job?.status === "cancelled"
+              ? "已取消排队（未创建任务、未计费）"
+              : job?.error ||
+                `排队等待超过 ${queueWaitMinutes.value} 分钟仍未提交成功，本次未创建任务、未计费；平台视频队列繁忙，请稍后重试`;
           return;
         }
         agnesTaskId = job.task_id;
@@ -372,13 +407,24 @@ export const useVideoStore = defineStore("video", () => {
   /** Re-attach to a job that was still waiting for queue capacity. */
   async function resumeJob(id: string) {
     try {
-      const job = await waitForJobTaskId(id, 900000, (tick) => {
-        if (tick.progress != null) progress.value = tick.progress;
-        taskStatus.value = tick.task_id ? "in_progress" : "queued";
-      });
+      cancelRequested.value = false;
+      const job = await waitForJobTaskId(
+        id,
+        jobWaitMs(),
+        (tick) => {
+          if (tick.progress != null) progress.value = tick.progress;
+          taskStatus.value = tick.task_id ? "in_progress" : "queued";
+        },
+        () => cancelRequested.value
+      );
       if (!job?.task_id) {
-        taskStatus.value = job?.status === "timeout" ? "timeout" : "failed";
-        error.value = job?.error || "排队超时，任务未能提交";
+        taskStatus.value = job?.status === "cancelled" ? "failed" : job?.status === "timeout" ? "timeout" : "failed";
+        error.value =
+          job?.status === "cancelled"
+            ? "已取消排队（未创建任务、未计费）"
+            : job?.error ||
+              `排队等待超过 ${queueWaitMinutes.value} 分钟仍未提交成功，本次未创建任务、未计费`;
+        persist();
         return;
       }
       taskId.value = job.task_id;
@@ -467,6 +513,7 @@ export const useVideoStore = defineStore("video", () => {
     maxSeconds,
     supportsLastFrame,
     maxReferenceImages,
+    queueWaitMinutes,
     // task state
     taskStatus,
     taskId,
@@ -497,6 +544,7 @@ export const useVideoStore = defineStore("video", () => {
     generate,
     restore,
     loadFromHistory,
+    cancelQueue,
     reset,
   };
 });

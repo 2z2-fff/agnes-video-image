@@ -84,6 +84,7 @@ npm run dev
 | GET | `/api/generate/{id}/download` | 下载视频 |
 | GET | `/api/history` | 最近生成记录（切换页面/刷新后可恢复） |
 | GET | `/api/jobs/{job_id}` | 队列满时的后台排队任务状态（POST 返回 202 时使用） |
+| POST | `/api/jobs/{job_id}/cancel` | 取消仍在排队的任务（已提交到 Agnes 的无法取消） |
 | DELETE | `/api/history/{id}` | 删除某条记录（文件保留） |
 | POST | `/api/image/generate` | 图片生成（`txt2img` / `img2img` / `cartoon`） |
 

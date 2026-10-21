@@ -67,6 +67,8 @@ export interface AppConfig {
     modes: GenerateMode[];
     supports_last_frame: boolean;
     max_reference_images: number;
+    /** How long the backend keeps retrying a full queue (drives the client window). */
+    queue_wait_minutes: number;
   };
   image: {
     model: string;
@@ -101,23 +103,42 @@ export async function getJob(jobId: string): Promise<JobResult> {
 
 /**
  * Poll a job until it exposes an Agnes task id (submission accepted) or fails.
- * The backend keeps retrying a full queue for ~30 minutes in the background, so
- * this window matches that budget.
+ *
+ * `timeoutMs` must stay **larger** than the backend's queue budget, otherwise
+ * the UI gives up while the backend keeps trying and the task is orphaned.
+ * Callers derive it from `/api/config.queue_wait_minutes`.
  */
 export async function waitForJobTaskId(
   jobId: string,
   timeoutMs = 2100000,
-  onTick?: (job: JobResult) => void
+  onTick?: (job: JobResult) => void,
+  isCancelled?: () => boolean
 ): Promise<JobResult | null> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    if (isCancelled?.()) {
+      return {
+        job_id: jobId,
+        status: "cancelled",
+        task_id: null,
+        video_url: null,
+        local_url: null,
+        progress: null,
+        error: "已取消排队",
+      };
+    }
     const job = await getJob(jobId);
     onTick?.(job);
     if (job.task_id) return job;
-    if (job.status === "failed" || job.status === "timeout") return job;
+    if (job.status === "failed" || job.status === "timeout" || job.status === "cancelled") return job;
     await new Promise((r) => setTimeout(r, 3000));
   }
   return null;
+}
+
+/** Cancel a job that is still waiting for queue capacity. */
+export async function cancelJob(jobId: string): Promise<void> {
+  await api.post(`/jobs/${jobId}/cancel`, null, { timeout: 30000 });
 }
 
 /** Query task status once (returns immediately). */

@@ -25,8 +25,14 @@ function formatTime(sec: number): string {
   <div v-else-if="store.taskStatus === 'queued'" class="status-container loading">
     <div class="loading-spinner"></div>
     <p class="status-text">正在提交任务...</p>
-    <p class="status-hint">若 Agnes 队列已满（同一时间只允许 1 个视频任务），会自动排队重试，最长约 7 分钟</p>
+    <p class="status-hint">
+      平台视频队列为共享资源，当前已满时会自动排队重试（最长约
+      {{ store.queueWaitMinutes }} 分钟），期间不会创建任务、不会计费
+    </p>
     <p v-if="store.elapsedSec > 0" class="status-timer">已等待 {{ formatTime(store.elapsedSec) }}</p>
+    <button v-if="store.jobId" class="retry-btn" @click="store.cancelQueue()">
+      取消排队
+    </button>
   </div>
 
   <!-- Processing state -->
