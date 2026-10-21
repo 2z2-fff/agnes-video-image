@@ -230,6 +230,7 @@ exit code 0
 | 8 | 参数校验 | `seconds=20` / `aspect_ratio=auto` | ✅ 正确拒绝 | `422`（Pydantic 白名单校验） |
 | 9 | 前端类型检查 | `npm run typecheck` | ✅ PASS | `vue-tsc --noEmit` 无报错（修复前有 `TS7053`） |
 | 10 | 配置接口 | `GET /api/config` | ✅ PASS | 正确返回当前模型与可用档位/比例 |
+| 11 | 默认配置落盘 | 不设 `UPLOADS_DIR`，跑 `backend/uploads` | ✅ PASS | `generated-d6a97711b900.png`，834,634 B（证明 #13 的失败纯属沙箱，非代码缺陷） |
 
 **关键实测结论（影响实现方案）**
 
@@ -268,4 +269,4 @@ exit code 0
 | 输出音轨 | 2.5 强调"音画协同"且有 `require_audio`，但完成响应无音频字段，是否原生带音轨待实测 |
 | 付费模型未验证 | `agnes-video-2.5`（1080P/2K）会产生费用，本次未测，仅验证了参数校验与 720P 通路 |
 | v2.0 存量调用 | 旧接口参数已被服务端拒绝，如有其他脚本仍用 `num_frames`，需一并迁移 |
-| 沙箱写入限制 | 本次测试用 `UPLOADS_DIR` 指向可写目录；正常（非沙箱）运行使用默认 `backend/uploads` 即可 |
+| 沙箱写入限制 | 本会话的受限沙箱无法写入项目子目录，测试期间用 `UPLOADS_DIR` 指向可写目录；已单独用完整权限验证默认 `backend/uploads` 正常落盘（见测试用例 11），正常运行时无需任何覆盖 |
