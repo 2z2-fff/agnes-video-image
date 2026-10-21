@@ -7,7 +7,9 @@ import PromptEngineer from "./PromptEngineer.vue";
 const store = useVideoStore();
 
 const showAdvanced = ref(false);
-const dragOver = ref(false);
+const dragOverFirst = ref(false);
+const dragOverLast = ref(false);
+const dragOverRefs = ref(false);
 
 const durationPresets = [4, 5, 6, 8, 10, 12];
 
@@ -20,7 +22,8 @@ const sizeLabels: Record<VideoSize, string> = {
 
 const modeTabs: { label: string; value: GenerateMode }[] = [
   { label: "文生视频", value: "txt2vid" },
-  { label: "图生视频", value: "img2vid" },
+  { label: "图生视频 / 首尾帧", value: "img2vid" },
+  { label: "多图参考", value: "reference" },
 ];
 
 // Only offer what the active model accepts (Flash = 720P only).
@@ -32,29 +35,56 @@ const flashOnlyHint = computed(
   () => store.availableSizes.length === 1 && store.model.includes("flash")
 );
 
+const refCount = computed(() => store.referenceImages.length);
+
+// Reference images must be addressed as <Picture N> in the prompt.
+const placeholderHint = computed(() => {
+  if (refCount.value === 0) {
+    return `最多 ${store.maxReferenceImages} 张`;
+  }
+  const names = Array.from({ length: refCount.value }, (_, i) => `<Picture ${i + 1}>`);
+  return `提示词中可用：${names.join(" ")}`;
+});
+
 onMounted(() => {
   store.loadConfig();
 });
 
-function onDrop(e: DragEvent) {
-  dragOver.value = false;
-  const file = e.dataTransfer?.files?.[0];
-  if (file && file.type.startsWith("image/")) {
-    store.handleImageUpload(file);
-  }
+function pickFile(e: Event, handler: (f: File) => void) {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (file) handler(file);
+  input.value = "";
 }
 
-function onFileSelect(e: Event) {
-  const target = e.target as HTMLInputElement;
-  const file = target.files?.[0];
-  if (file) {
-    store.handleImageUpload(file);
-  }
+function onFirstDrop(e: DragEvent) {
+  dragOverFirst.value = false;
+  const file = e.dataTransfer?.files?.[0];
+  if (file && file.type.startsWith("image/")) store.handleImageUpload(file);
+}
+
+function onLastDrop(e: DragEvent) {
+  dragOverLast.value = false;
+  const file = e.dataTransfer?.files?.[0];
+  if (file && file.type.startsWith("image/")) store.handleLastImageUpload(file);
+}
+
+function onRefsDrop(e: DragEvent) {
+  dragOverRefs.value = false;
+  const files = e.dataTransfer?.files;
+  if (files && files.length) store.addReferenceImages(files);
+}
+
+function onRefsSelect(e: Event) {
+  const input = e.target as HTMLInputElement;
+  if (input.files && input.files.length) store.addReferenceImages(input.files);
+  input.value = "";
 }
 
 function canGenerate(): boolean {
   if (!store.prompt.trim()) return false;
   if (store.mode === "img2vid" && !store.imageBase64) return false;
+  if (store.mode === "reference" && refCount.value === 0) return false;
   return !store.isGenerating;
 }
 </script>
@@ -73,33 +103,112 @@ function canGenerate(): boolean {
       </button>
     </div>
 
-    <!-- Image Upload (img2vid only) -->
+    <!-- Keyframe uploads: first frame (required) + last frame (optional) -->
     <div v-if="store.mode === 'img2vid'" class="form-section">
-      <label class="form-label">参考图片</label>
-      <div
-        v-if="!store.imagePreview"
-        class="upload-zone"
-        :class="{ dragover: dragOver }"
-        @dragover.prevent="dragOver = true"
-        @dragleave="dragOver = false"
-        @drop.prevent="onDrop"
-      >
-        <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M12 16V4M12 4L7 9M12 4L17 9" stroke-linecap="round" stroke-linejoin="round" />
-          <path d="M3 15v4a2 2 0 002 2h14a2 2 0 002-2v-4" stroke-linecap="round" />
-        </svg>
-        <p class="upload-text">拖拽图片到此处或<span class="upload-link">点击上传</span></p>
-        <p class="upload-hint">支持 PNG / JPG / WebP</p>
-        <input type="file" accept="image/*" class="file-input" @change="onFileSelect" />
+      <label class="form-label">
+        首帧 / 尾帧
+        <span class="char-count">首帧必填，尾帧可选</span>
+      </label>
+      <div class="upload-pair">
+        <!-- First frame -->
+        <div class="frame-slot">
+          <span class="slot-label">首帧 *</span>
+          <div
+            v-if="!store.imagePreview"
+            class="upload-zone compact"
+            :class="{ dragover: dragOverFirst }"
+            @dragover.prevent="dragOverFirst = true"
+            @dragleave="dragOverFirst = false"
+            @drop.prevent="onFirstDrop"
+          >
+            <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M12 16V4M12 4L7 9M12 4L17 9" stroke-linecap="round" stroke-linejoin="round" />
+              <path d="M3 15v4a2 2 0 002 2h14a2 2 0 002-2v-4" stroke-linecap="round" />
+            </svg>
+            <p class="upload-text">点击/拖拽上传</p>
+            <input type="file" accept="image/*" class="file-input" @change="(e) => pickFile(e, store.handleImageUpload)" />
+          </div>
+          <div v-else class="image-preview">
+            <img :src="store.imagePreview" alt="首帧" class="preview-img" />
+            <button class="remove-btn" @click="store.clearImage">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Last frame -->
+        <div class="frame-slot">
+          <span class="slot-label">尾帧（可选）</span>
+          <div
+            v-if="!store.lastImagePreview"
+            class="upload-zone compact"
+            :class="{ dragover: dragOverLast }"
+            @dragover.prevent="dragOverLast = true"
+            @dragleave="dragOverLast = false"
+            @drop.prevent="onLastDrop"
+          >
+            <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M12 16V4M12 4L7 9M12 4L17 9" stroke-linecap="round" stroke-linejoin="round" />
+              <path d="M3 15v4a2 2 0 002 2h14a2 2 0 002-2v-4" stroke-linecap="round" />
+            </svg>
+            <p class="upload-text">点击/拖拽上传</p>
+            <input type="file" accept="image/*" class="file-input" @change="(e) => pickFile(e, store.handleLastImageUpload)" />
+          </div>
+          <div v-else class="image-preview">
+            <img :src="store.lastImagePreview" alt="尾帧" class="preview-img" />
+            <button class="remove-btn" @click="store.clearLastImage">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+              </svg>
+            </button>
+          </div>
+        </div>
       </div>
-      <div v-else class="image-preview">
-        <img :src="store.imagePreview" alt="参考图片" class="preview-img" />
-        <button class="remove-btn" @click="store.clearImage">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+      <p class="upload-hint">只传首帧 = 图生视频；同时传尾帧 = 首尾帧过渡（成片首尾会尽量贴合这两张图）</p>
+    </div>
+
+    <!-- Reference images (multi) -->
+    <div v-if="store.mode === 'reference'" class="form-section">
+      <label class="form-label">
+        参考图片
+        <span class="char-count">{{ refCount }} / {{ store.maxReferenceImages }}</span>
+      </label>
+      <div class="ref-grid">
+        <div
+          v-for="(img, i) in store.referenceImages"
+          :key="i"
+          class="ref-item"
+        >
+          <img :src="img.preview" :alt="`参考图 ${i + 1}`" class="preview-img" />
+          <span class="ref-index">Picture {{ i + 1 }}</span>
+          <button class="remove-btn" @click="store.removeReferenceImage(i)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+            </svg>
+          </button>
+        </div>
+
+        <div
+          v-if="refCount < store.maxReferenceImages"
+          class="upload-zone compact ref-add"
+          :class="{ dragover: dragOverRefs }"
+          @dragover.prevent="dragOverRefs = true"
+          @dragleave="dragOverRefs = false"
+          @drop.prevent="onRefsDrop"
+        >
+          <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M12 5v14M5 12h14" stroke-linecap="round" />
           </svg>
-        </button>
+          <p class="upload-text">添加图片</p>
+          <input type="file" accept="image/*" multiple class="file-input" @change="onRefsSelect" />
+        </div>
       </div>
+      <p class="upload-hint">{{ placeholderHint }}</p>
+      <p class="upload-hint">
+        参考图只作内容/风格参考，成片可能重新构图；若需要严格锁定起止画面，请用「图生视频 / 首尾帧」
+      </p>
     </div>
 
     <!-- Prompt Input -->
@@ -355,6 +464,79 @@ function canGenerate(): boolean {
 .remove-btn svg {
   width: 16px;
   height: 16px;
+}
+
+/* Keyframe pair (first / last) */
+.upload-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.frame-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.slot-label {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.upload-zone.compact {
+  padding: 20px 10px;
+}
+
+.upload-zone.compact .upload-icon {
+  width: 22px;
+  height: 22px;
+  margin-bottom: 4px;
+}
+
+.upload-zone.compact .upload-text {
+  font-size: 12px;
+}
+
+/* Reference image grid */
+.ref-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.ref-item {
+  position: relative;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--surface-card);
+  aspect-ratio: 1 / 1;
+}
+
+.ref-item .preview-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  max-height: none;
+}
+
+.ref-index {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 10px;
+}
+
+.ref-add {
+  aspect-ratio: 1 / 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
 }
 
 /* Prompt input */

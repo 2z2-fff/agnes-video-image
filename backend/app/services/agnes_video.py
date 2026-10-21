@@ -31,6 +31,7 @@ from app.config import (
     POLL_TIMEOUT_SEC,
     QUERY_VIDEO_URL,
     VIDEO_MODEL,
+    max_reference_images,
 )
 from app.schemas import GenerateRequest, TaskResponse
 from app.services.agnes_image import _ensure_png_data_uri
@@ -74,7 +75,11 @@ def _get_headers() -> dict:
 
 def _api_mode(req: GenerateRequest) -> str:
     """Map the UI mode onto the API's `mode` value."""
-    return "keyframe" if req.mode == req.mode.img2vid else "text"
+    return {
+        req.mode.txt2vid: "text",
+        req.mode.img2vid: "keyframe",
+        req.mode.reference: "reference",
+    }[req.mode]
 
 
 def _build_prompt(req: GenerateRequest) -> str:
@@ -101,6 +106,18 @@ def _validate_model_and_size(req: GenerateRequest) -> None:
             ),
         )
 
+    if req.mode == req.mode.reference:
+        limit = max_reference_images()
+        count = len([i for i in (req.images or []) if i])
+        if count > limit:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{VIDEO_MODEL} 的参考图片上限为 {limit} 张（本次 {count} 张）。"
+                    "如需更多，请把 AGNES_VIDEO_MODEL 设为 agnes-video-2.5（上限 8 张）。"
+                ),
+            )
+
 
 def _first_frame_value(image: str) -> str:
     """Normalise the uploaded image into the `first_frame` value.
@@ -114,7 +131,13 @@ def _first_frame_value(image: str) -> str:
 
 
 def _build_body(req: GenerateRequest) -> dict:
-    """Build the create-task body for Video 2.5."""
+    """Build the create-task body for Video 2.5.
+
+    Media routing (mutually exclusive, enforced by the schema):
+
+    * ``keyframe``  -> ``first_frame`` and optional ``last_frame``
+    * ``reference`` -> ``images`` array (referenced as <Picture N> in the prompt)
+    """
     body: dict = {
         "model": VIDEO_MODEL,
         "prompt": _build_prompt(req),
@@ -128,6 +151,22 @@ def _build_body(req: GenerateRequest) -> dict:
         if not req.image:
             raise HTTPException(status_code=400, detail="img2vid 模式需要上传一张参考图片")
         body["first_frame"] = _first_frame_value(req.image)
+        if req.last_image:
+            # first + last frame pair turns the task into a controlled transition
+            body["last_frame"] = _first_frame_value(req.last_image)
+
+    elif req.mode == req.mode.reference:
+        refs = [i for i in (req.images or []) if i]
+        if not refs:
+            raise HTTPException(status_code=400, detail="多图参考模式至少需要上传 1 张图片")
+        body["images"] = [_first_frame_value(i) for i in refs]
+        logger.info("reference mode: %d image(s) attached", len(refs))
+
+        if "<Picture" not in req.prompt:
+            logger.warning(
+                "reference mode prompt has no <Picture N> placeholder; "
+                "the docs recommend naming each reference explicitly."
+            )
 
     if req.seed is not None:
         body["seed"] = req.seed

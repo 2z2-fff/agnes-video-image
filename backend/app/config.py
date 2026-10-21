@@ -35,10 +35,17 @@ VIDEO_MIN_SECONDS = 4
 VIDEO_MAX_SECONDS = 12
 
 # Reference-media limits (agnes-video-2.5)
-VIDEO_MAX_IMAGES = 8
+VIDEO_MAX_IMAGES = 8          # mode="reference", agnes-video-2.5
+FLASH_MAX_IMAGES = 5          # mode="reference", agnes-video-2.5-flash
 VIDEO_MAX_AUDIOS = 3
 VIDEO_MAX_VIDEOS = 1
 VIDEO_MAX_REFERENCE_FILES = 12
+
+
+def max_reference_images(model: str | None = None) -> int:
+    """How many `images` the given model accepts in `reference` mode."""
+    target = model or VIDEO_MODEL
+    return FLASH_MAX_IMAGES if target.endswith("flash") else VIDEO_MAX_IMAGES
 
 # Polling: docs recommend every 1–2s until completed/failed.
 POLL_INTERVAL_SEC = 2

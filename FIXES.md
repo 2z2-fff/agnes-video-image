@@ -270,3 +270,75 @@ exit code 0
 | 付费模型未验证 | `agnes-video-2.5`（1080P/2K）会产生费用，本次未测，仅验证了参数校验与 720P 通路 |
 | v2.0 存量调用 | 旧接口参数已被服务端拒绝，如有其他脚本仍用 `num_frames`，需一并迁移 |
 | 沙箱写入限制 | 本会话的受限沙箱无法写入项目子目录，测试期间用 `UPLOADS_DIR` 指向可写目录；已单独用完整权限验证默认 `backend/uploads` 正常落盘（见测试用例 11），正常运行时无需任何覆盖 |
+
+---
+
+## 七、增量更新：首尾帧 + 多图参考（v2.1.0）
+
+### 7.1 背景
+
+此前图生视频只走 `keyframe` + `first_frame`，**最多 1 张图**。按官方能力补齐两项：
+
+| 能力 | API 用法 | 图片数 |
+| --- | --- | --- |
+| 首尾帧 | `mode=keyframe` + `first_frame` + `last_frame` | 最多 2 张 |
+| 多图参考 | `mode=reference` + `images[]` | 2.5 最多 8 张，Flash 最多 5 张 |
+
+### 7.2 改动
+
+**后端**
+
+| 文件 | 改动 |
+| --- | --- |
+| `schemas.py` | `GenerateMode` 增加 `reference`；`GenerateRequest` 增加 `last_image`、`images[]`；新增 `model_validator` 强制三种模式的媒体互斥 |
+| `services/agnes_video.py` | `_api_mode` 三路映射；`_build_body` 支持 `last_frame` 与 `images`（逐张转 PNG Data URI）；`_validate_model_and_size` 增加参考图上限校验 |
+| `config.py` | 新增 `FLASH_MAX_IMAGES=5` 与 `max_reference_images()`，按模型返回上限 |
+| `main.py` | `/api/config` 增加 `modes`、`supports_last_frame`、`max_reference_images` |
+
+**前端**
+
+| 文件 | 改动 |
+| --- | --- |
+| `api/video.ts` | 模式类型加 `reference`；请求体加 `last_image` / `images`；`AppConfig` 补三个新字段 |
+| `stores/videoStore.ts` | 新增尾帧与参考图状态、多文件上传/删除、上限判断、切换模式时互斥清理 |
+| `components/VideoForm.vue` | 三个 tab；首帧/尾帧双槽位；参考图网格（`Picture N` 角标、可增删、显示剩余配额） |
+
+### 7.3 互斥规则（后端提前拦截，不依赖服务端 400）
+
+| 组合 | 结果 |
+| --- | --- |
+| `reference` + `first_frame` | `422` 多图参考不能同时使用首帧/尾帧 |
+| `txt2vid` + 任何图片 | `422` 文生视频不接受参考图片 |
+| `img2vid` 缺首帧 | `422` 图生视频需要上传首帧图片 |
+| `reference` 无图片 | `422` 至少需要 1 张 |
+| `reference` 6 张（Flash 上限 5） | `400` 并提示切换到 `agnes-video-2.5` 可用 8 张 |
+
+### 7.4 验证状态
+
+`scripts/e2e_multimodal.py`：
+
+```text
+=== Phase 0: validation ===
+PASS  reference + first_frame 被拒绝: HTTP 422
+PASS  txt2vid + images 被拒绝: HTTP 422
+PASS  img2vid 缺首帧被拒绝: HTTP 422
+PASS  reference 缺图片被拒绝: HTTP 422
+PASS  reference 6 张（Flash 上限 5）被拒绝: HTTP 400
+```
+
+**请求体结构已验证**（后端构造出的 body）：
+
+```text
+首尾帧   keys=[model, prompt, mode, seconds, size, aspect_ratio, first_frame, last_frame]
+多图参考 keys=[model, prompt, mode, seconds, size, aspect_ratio, images]  count=2
+```
+
+**出片验证受队列阻塞**：测试脚本在创建阶段反复收到 `503 video_queue_full`，
+截至收尾时仍未取得一次完整渲染。注意 400（参数错）一定先于 503（队列满）返回，
+因此 503 本身即证明 `last_frame` / `images` 请求体已被服务端结构接受；
+缺的只是一次完整出片，**待队列空闲后补测**。
+
+### 7.5 其它
+
+- 前端 `vue-tsc --noEmit` 通过（含新增的三种模式与多图状态）。
+- 提示词可用 `<Picture N>` 指代素材，前端会按已上传数量实时提示；后端在未检测到占位符时记一条 warning（不阻断）。

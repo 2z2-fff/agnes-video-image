@@ -20,6 +20,7 @@ from app.config import (
     VIDEO_MIN_SECONDS,
     VIDEO_MODEL,
     VIDEO_SIZES,
+    max_reference_images,
 )
 from app.api.video import router as video_router
 from app.api.image import router as image_router
@@ -81,6 +82,11 @@ async def config():
             "aspect_ratios": list(VIDEO_ASPECT_RATIOS),
             "min_seconds": VIDEO_MIN_SECONDS,
             "max_seconds": VIDEO_MAX_SECONDS,
+            "modes": ["txt2vid", "img2vid", "reference"],
+            # img2vid accepts an optional last frame -> first/last transition
+            "supports_last_frame": True,
+            # mode="reference" image cap for the active model
+            "max_reference_images": max_reference_images(),
         },
         "image": {
             "model": IMAGE_MODEL,

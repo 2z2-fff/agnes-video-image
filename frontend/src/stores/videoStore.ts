@@ -12,13 +12,27 @@ import {
   type VideoSize,
 } from "../api/video";
 
+/** One uploaded reference image (reference mode). */
+export interface ReferenceImage {
+  preview: string; // data URL for <img>
+  base64: string;  // raw base64 for the API
+}
+
+function toBase64(dataUrl: string): string {
+  const idx = dataUrl.indexOf(";base64,");
+  return idx !== -1 ? dataUrl.slice(idx + 8) : dataUrl;
+}
+
 export const useVideoStore = defineStore("video", () => {
   // ─── Form state ───────────────────────────────
   const mode = ref<GenerateMode>("txt2vid");
   const prompt = ref("");
   const negativePrompt = ref("");
-  const imagePreview = ref<string | null>(null); // data URL for <img> preview
-  const imageBase64 = ref<string | null>(null); // pure base64 for API
+  const imagePreview = ref<string | null>(null); // first frame preview
+  const imageBase64 = ref<string | null>(null); // first frame, raw base64
+  const lastImagePreview = ref<string | null>(null); // optional last frame
+  const lastImageBase64 = ref<string | null>(null);
+  const referenceImages = ref<ReferenceImage[]>([]); // reference mode
   const aspectRatio = ref<AspectRatio>("16:9");
   const seconds = ref(5);
   const size = ref<VideoSize>("720P");
@@ -37,6 +51,8 @@ export const useVideoStore = defineStore("video", () => {
   ]);
   const minSeconds = ref(4);
   const maxSeconds = ref(12);
+  const supportsLastFrame = ref(true);
+  const maxReferenceImages = ref(8);
 
   // ─── Task state ───────────────────────────────
   const taskStatus = ref<TaskStatus>("idle");
@@ -60,6 +76,8 @@ export const useVideoStore = defineStore("video", () => {
   const downloadUrl = computed(() =>
     taskId.value ? getDownloadUrl(taskId.value) : null
   );
+  const isKeyframeMode = computed(() => mode.value === "img2vid");
+  const isReferenceMode = computed(() => mode.value === "reference");
 
   // ─── Actions ─────────────────────────────────
   async function loadConfig() {
@@ -70,7 +88,9 @@ export const useVideoStore = defineStore("video", () => {
       availableRatios.value = cfg.video.aspect_ratios;
       minSeconds.value = cfg.video.min_seconds;
       maxSeconds.value = cfg.video.max_seconds;
-      // Keep the selection inside what this model accepts.
+      supportsLastFrame.value = cfg.video.supports_last_frame ?? true;
+      maxReferenceImages.value = cfg.video.max_reference_images ?? 8;
+
       if (!cfg.video.sizes.includes(size.value)) {
         size.value = cfg.video.sizes[0];
       }
@@ -80,33 +100,79 @@ export const useVideoStore = defineStore("video", () => {
       if (seconds.value < cfg.video.min_seconds) seconds.value = cfg.video.min_seconds;
       if (seconds.value > cfg.video.max_seconds) seconds.value = cfg.video.max_seconds;
     } catch {
-      // Config is a convenience; the backend still validates.
+      // Config is a convenience; the backend still validates everything.
     }
+  }
+
+  function clearKeyframe() {
+    imagePreview.value = null;
+    imageBase64.value = null;
+    lastImagePreview.value = null;
+    lastImageBase64.value = null;
+  }
+
+  function clearReferences() {
+    referenceImages.value = [];
   }
 
   function setMode(newMode: GenerateMode) {
     mode.value = newMode;
+    // Media from one mode is invalid in another (the API treats them as exclusive).
     if (newMode === "txt2vid") {
-      imagePreview.value = null;
-      imageBase64.value = null;
+      clearKeyframe();
+      clearReferences();
+    } else if (newMode === "img2vid") {
+      clearReferences();
+    } else {
+      clearKeyframe();
     }
   }
 
-  function handleImageUpload(file: File) {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = reader.result as string;
-      imagePreview.value = dataUrl;
-      // Extract pure base64 (strip data URI prefix); the backend re-encodes to PNG.
-      const idx = dataUrl.indexOf(";base64,");
-      imageBase64.value = idx !== -1 ? dataUrl.slice(idx + 8) : dataUrl;
-    };
-    reader.readAsDataURL(file);
+  function _readFile(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function handleImageUpload(file: File) {
+    const dataUrl = await _readFile(file);
+    imagePreview.value = dataUrl;
+    imageBase64.value = toBase64(dataUrl);
+  }
+
+  async function handleLastImageUpload(file: File) {
+    const dataUrl = await _readFile(file);
+    lastImagePreview.value = dataUrl;
+    lastImageBase64.value = toBase64(dataUrl);
   }
 
   function clearImage() {
     imagePreview.value = null;
     imageBase64.value = null;
+  }
+
+  function clearLastImage() {
+    lastImagePreview.value = null;
+    lastImageBase64.value = null;
+  }
+
+  async function addReferenceImages(files: File[] | FileList) {
+    for (const file of Array.from(files)) {
+      if (referenceImages.value.length >= maxReferenceImages.value) {
+        error.value = `参考图片最多 ${maxReferenceImages.value} 张`;
+        break;
+      }
+      if (!file.type.startsWith("image/")) continue;
+      const dataUrl = await _readFile(file);
+      referenceImages.value.push({ preview: dataUrl, base64: toBase64(dataUrl) });
+    }
+  }
+
+  function removeReferenceImage(index: number) {
+    referenceImages.value.splice(index, 1);
   }
 
   async function generate() {
@@ -115,8 +181,18 @@ export const useVideoStore = defineStore("video", () => {
       return;
     }
     if (mode.value === "img2vid" && !imageBase64.value) {
-      error.value = "请上传一张图片";
+      error.value = "请上传首帧图片";
       return;
+    }
+    if (mode.value === "reference") {
+      if (referenceImages.value.length === 0) {
+        error.value = "请至少上传 1 张参考图片";
+        return;
+      }
+      if (referenceImages.value.length > maxReferenceImages.value) {
+        error.value = `参考图片最多 ${maxReferenceImages.value} 张`;
+        return;
+      }
     }
 
     taskStatus.value = "queued";
@@ -135,6 +211,11 @@ export const useVideoStore = defineStore("video", () => {
         mode: mode.value,
         prompt: prompt.value,
         image: mode.value === "img2vid" ? imageBase64.value : null,
+        last_image: mode.value === "img2vid" ? lastImageBase64.value : null,
+        images:
+          mode.value === "reference"
+            ? referenceImages.value.map((r) => r.base64)
+            : null,
         aspect_ratio: aspectRatio.value,
         seconds: seconds.value,
         size: size.value,
@@ -179,6 +260,9 @@ export const useVideoStore = defineStore("video", () => {
     negativePrompt,
     imagePreview,
     imageBase64,
+    lastImagePreview,
+    lastImageBase64,
+    referenceImages,
     aspectRatio,
     seconds,
     size,
@@ -189,6 +273,8 @@ export const useVideoStore = defineStore("video", () => {
     availableRatios,
     minSeconds,
     maxSeconds,
+    supportsLastFrame,
+    maxReferenceImages,
     // task state
     taskStatus,
     taskId,
@@ -202,11 +288,18 @@ export const useVideoStore = defineStore("video", () => {
     isFailed,
     streamUrl,
     downloadUrl,
+    isKeyframeMode,
+    isReferenceMode,
     // actions
     loadConfig,
     setMode,
     handleImageUpload,
+    handleLastImageUpload,
     clearImage,
+    clearLastImage,
+    addReferenceImages,
+    removeReferenceImage,
+    clearReferences,
     generate,
     reset,
   };

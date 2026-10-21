@@ -2,7 +2,7 @@ import api from "./index";
 
 // ─── Types ─────────────────────────────────────────
 
-export type GenerateMode = "txt2vid" | "img2vid";
+export type GenerateMode = "txt2vid" | "img2vid" | "reference";
 export type AspectRatio = "21:9" | "16:9" | "4:3" | "1:1" | "3:4" | "9:16";
 export type VideoSize = "720P" | "1080P" | "1K" | "2K";
 export type TaskStatus = "idle" | "queued" | "in_progress" | "completed" | "failed" | "timeout";
@@ -10,7 +10,11 @@ export type TaskStatus = "idle" | "queued" | "in_progress" | "completed" | "fail
 export interface GenerateRequest {
   mode: GenerateMode;
   prompt: string;
+  /** img2vid: first frame (required) and optional last frame, raw base64 */
   image?: string | null;
+  last_image?: string | null;
+  /** reference mode: 1..N images, raw base64 */
+  images?: string[] | null;
   aspect_ratio: AspectRatio;
   /** 4–12 seconds (Agnes Video 2.5) */
   seconds: number;
@@ -44,6 +48,9 @@ export interface AppConfig {
     aspect_ratios: AspectRatio[];
     min_seconds: number;
     max_seconds: number;
+    modes: GenerateMode[];
+    supports_last_frame: boolean;
+    max_reference_images: number;
   };
   image: {
     model: string;

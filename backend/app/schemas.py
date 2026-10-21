@@ -2,7 +2,7 @@
 
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.config import (
     IMAGE_RATIOS,
@@ -19,12 +19,14 @@ class GenerateMode(str, Enum):
 
     These are UI-level names; the service maps them onto the API's `mode`:
 
-    * ``txt2vid`` -> ``text``     (prompt only)
-    * ``img2vid`` -> ``keyframe`` (first_frame locks the opening frame)
+    * ``txt2vid``   -> ``text``     (prompt only)
+    * ``img2vid``   -> ``keyframe`` (first_frame, optional last_frame)
+    * ``reference`` -> ``reference``(images[] used as content/style references)
     """
 
     txt2vid = "txt2vid"
     img2vid = "img2vid"
+    reference = "reference"
 
 
 class GenerateRequest(BaseModel):
@@ -34,7 +36,17 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=2000, description="Video content description")
     image: str | None = Field(
         None,
-        description="Reference image for img2vid: data URI or raw base64 (converted to PNG)",
+        description="img2vid first frame: data URI or raw base64 (converted to PNG)",
+    )
+    last_image: str | None = Field(
+        None,
+        description="img2vid optional last frame: data URI or raw base64. "
+        "Supplying it turns the task into a first/last-frame transition.",
+    )
+    images: list[str] | None = Field(
+        None,
+        description="reference mode: 1..N images (N = 8 for agnes-video-2.5, 5 for Flash). "
+        "Refer to them in the prompt as <Picture 1>, <Picture 2>, ...",
     )
     aspect_ratio: str = Field("16:9", description="21:9, 16:9, 4:3, 1:1, 3:4, 9:16")
     seconds: int = Field(
@@ -64,6 +76,33 @@ class GenerateRequest(BaseModel):
         if v not in VIDEO_SIZES:
             raise ValueError(f"size must be one of {list(VIDEO_SIZES)}")
         return v
+
+    @model_validator(mode="after")
+    def _validate_media_for_mode(self) -> "GenerateRequest":
+        """Enforce the API's mutually exclusive media rules.
+
+        The service rejects a body that mixes `first_frame`/`last_frame` with
+        `images`, so catch it here with a clear message instead of a raw 400.
+        """
+        images = [i for i in (self.images or []) if i]
+
+        if self.mode == GenerateMode.txt2vid:
+            if self.image or self.last_image or images:
+                raise ValueError("文生视频模式不接受参考图片，请切换到图生视频或多图参考")
+        elif self.mode == GenerateMode.img2vid:
+            if not self.image:
+                raise ValueError("图生视频模式需要上传首帧图片")
+            if images:
+                raise ValueError("首帧/尾帧 与 多图参考 不能同时使用，请分别提交")
+        else:  # reference
+            if not images:
+                raise ValueError("多图参考模式至少需要上传 1 张图片")
+            if self.image or self.last_image:
+                raise ValueError("多图参考模式不能同时使用首帧/尾帧")
+            if len(images) > 8:
+                raise ValueError("参考图片最多 8 张")
+
+        return self
 
 
 class TaskResponse(BaseModel):
