@@ -449,7 +449,7 @@ async def query_task_status(video_id: str) -> TaskResponse:
         local_url = await _persist_video_file(video_id, video_url)
 
     updated = history.update_record(
-        task_id=video_id,
+        by_task_id=video_id,
         status=status,
         remote_url=video_url,
         local_url=local_url,

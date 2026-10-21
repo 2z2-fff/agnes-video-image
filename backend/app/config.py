@@ -52,6 +52,10 @@ REF_TOTAL_MAX_MB = int(os.getenv("REF_TOTAL_MAX_MB", "45"))  # API limit is 50MB
 # timeout; anything slower is handed to the background job instead.
 FAST_SUBMIT_TIMEOUT_SEC = float(os.getenv("FAST_SUBMIT_TIMEOUT_SEC", "20"))
 
+# A job still "submitting" after this long is considered dead (the background
+# task does not survive a process restart), so the UI stops polling forever.
+SUBMIT_STALE_SEC = int(os.getenv("SUBMIT_STALE_SEC", "2400"))
+
 
 def max_reference_images(model: str | None = None) -> int:
     """How many `images` the given model accepts in `reference` mode."""

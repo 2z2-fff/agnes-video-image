@@ -604,3 +604,53 @@ POST /api/generate → HTTP 202 in 2.90s    （不报错，转后台）
   避免影响出图质量与构图一致性。
 - 多图参考现在 5 张照片级图片（Flash 上限）约 18MB，仍在 45MB 护栏内。
 
+### 10.6 验证过程中发现并修复的两个隐藏 Bug（v2.3.2）
+
+**Bug A（严重）：后台排队成功后，`task_id` 写不进记录**
+
+现象：job 状态变成 `queued`，但 `task_id` 始终为空 → 前端永远轮询不到任务，30 分钟后被判超时。
+
+根因是**参数名撞车**：
+
+```python
+def update_record(record_id=None, task_id=None, **fields):   # ← task_id 既是查询键
+    ...
+# 调用方想"按 record_id 更新，并把 task_id 写成新值"
+history.update_record(record_id=rid, task_id=video_id, status="queued")
+#                                  ↑ 被 Python 绑定到查询参数，永远写不进字段
+```
+
+修复：查询参数改名 `by_task_id`，`task_id` 回归纯字段；两处调用点同步调整。
+回归测试：
+
+```text
+task_id = TASK_REGRESSION      （修复前为空）
+status  = queued
+after by_task_id update: completed /x.mp4
+REGRESSION TEST PASSED
+```
+
+**Bug B：`history.json` 并发写入丢记录**
+
+用第二个 uvicorn 实例（8001 端口）做超时测试时，两条记录被互相覆盖消失了。
+根因是"读 → 改 → 整文件重写"在多进程下会丢失更新（`uvicorn --workers>1` 同样会中招）。
+
+修复：`add/update/delete` 全部包在**跨进程文件锁**里（Windows `msvcrt.locking`，POSIX `fcntl.flock`），
+拿不到锁时降级为不加锁并记 warning，不影响主流程。
+
+**连带改进**：`GET /api/jobs/{id}` 对"长期停在 submitting"的记录（超过 `SUBMIT_STALE_SEC=40min`）
+自动判定失败并给出原因，避免界面无限转圈。
+
+### 10.7 job 链路验证（不依赖队列空闲）
+
+队列持续满载时无法等真实提交成功，于是注入一条带**真实 Agnes 任务 ID** 的记录来验证读取链路：
+
+```text
+[1] injected job 398bb3631c6a -> agnes task task_mglL...
+[2] HTTP 200 status=completed task_id=task_mglL... local_url=/uploads/videos/task_mglL....mp4
+[3] persisted record: status=completed local_url=/uploads/videos/task_mglL....mp4
+RESULT: PASS
+```
+
+配合 10.6 的回归测试，202 链路的每个环节（返回 job → 后台提交 → 回填 task_id → 轮询 → 落盘）都已覆盖。
+

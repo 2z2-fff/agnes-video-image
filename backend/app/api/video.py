@@ -2,12 +2,13 @@
 
 import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app import history
-from app.config import FAST_SUBMIT_TIMEOUT_SEC, POLL_TIMEOUT_SEC
+from app.config import FAST_SUBMIT_TIMEOUT_SEC, POLL_TIMEOUT_SEC, SUBMIT_STALE_SEC
 from app.schemas import CreateTaskResponse, GenerateRequest, JobResponse, TaskResponse
 from app.services import agnes_video
 
@@ -101,13 +102,27 @@ async def get_job(job_id: str):
 
     task_id = record.get("task_id")
     if not task_id:
-        return JobResponse(
-            job_id=job_id,
-            status=record.get("status", "submitting"),
-            progress=record.get("progress"),
-            error=record.get("error"),
-            prompt=record.get("prompt"),
-        )
+        # A background submit does not survive a restart; don't leave the UI
+        # polling a job that can never progress.
+        age = time.time() - (record.get("created_at") or 0)
+        if record.get("status") == "submitting" and age > SUBMIT_STALE_SEC:
+            history.update_record(
+                record_id=job_id,
+                status="failed",
+                error=(
+                    f"排队提交已超时（等待约 {int(age // 60)} 分钟，后台任务可能因服务重启中断）；"
+                    "本次未创建任务、未计费，请重新提交"
+                ),
+            )
+            record = history.get_record(job_id) or record
+        else:
+            return JobResponse(
+                job_id=job_id,
+                status=record.get("status", "submitting"),
+                progress=record.get("progress"),
+                error=record.get("error"),
+                prompt=record.get("prompt"),
+            )
 
     if record.get("status") in TERMINAL:
         return JobResponse(
