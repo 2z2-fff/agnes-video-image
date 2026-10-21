@@ -1,52 +1,54 @@
-"""Agnes Image 2.1 Flash API service — wrapper for image generation.
+"""Agnes Image 2.5 Flash service — wrapper for image generation.
 
-Handles: txt2img and img2img generation, PNG conversion, rate limiting,
-image download and local storage.
-All httpx calls bypass system proxy to avoid silent failures.
+Official contract (https://agnes-ai.com/en/docs/agnes-image-25-flash):
+
+* ``POST {base}/v1/images/generations``
+* text-to-image: ``model``, ``prompt``, ``size`` (tier 1K/2K/3K/4K) + ``ratio``
+* image-to-image: input images go in ``extra_body.image`` as public URLs or
+  Data URI Base64; ``extra_body.response_format`` must NOT be top-level.
+* response: ``data[0].url`` or ``data[0].b64_json``
+
+All httpx calls bypass the system proxy to avoid silent failures.
 """
 
 import asyncio
 import base64
 import io
 import logging
-import time
 import uuid
+
 import httpx
 from fastapi import HTTPException
 
 from app.config import (
     AGNES_API_KEY,
     IMAGE_CREATE_URL,
+    IMAGE_MAX_RETRIES,
     IMAGE_MODEL,
+    IMAGE_NETWORK_RETRY_DELAYS,
     IMAGE_RATE_LIMIT_COOLD,
     IMAGE_SERVICE_UNAVAIL_COOLD,
-    IMAGE_MAX_RETRIES,
-    IMAGE_NETWORK_RETRY_DELAYS,
     UPLOADS_DIR,
 )
 from app.schemas import ImageGenerateRequest, ImageGenerateResponse
 
 logger = logging.getLogger(__name__)
 
-# Track last 4K request time for rate limiting
-_last_4k_time: float = 0.0
-
 
 # ─── Internal helpers ──────────────────────────────────────────────
 
 
 def _no_proxy_client(**kwargs) -> httpx.AsyncClient:
-    """Create an httpx client that bypasses system proxy.
+    """Create an httpx client that bypasses the system proxy.
 
-    System proxy causes silent failures when calling the Agnes API.
-    Same pattern as the video service.
+    A system proxy causes silent failures against the Agnes API.
     """
     transport = httpx.AsyncHTTPTransport(proxy=None)
     return httpx.AsyncClient(transport=transport, **kwargs)
 
 
 def _get_headers() -> dict:
-    """Build authorization headers for Agnes API."""
+    """Build authorization headers for the Agnes API."""
     return {
         "Authorization": f"Bearer {AGNES_API_KEY}",
         "Content-Type": "application/json",
@@ -56,19 +58,12 @@ def _get_headers() -> dict:
 def _ensure_png_data_uri(image_data: str) -> str:
     """Convert any image format to a PNG data URI.
 
-    The Agnes Image API requires PNG format. If a WebP or JPEG is sent
-    with a mismatched MIME type, the API silently falls back to text2img,
-    causing image drift (the generated image looks nothing like the input).
-
-    This function:
-    1. Decodes the input (data URI or raw base64)
-    2. Opens with Pillow (auto-detects format)
-    3. Re-encodes as PNG data URI
-    4. Raises an error if conversion fails (NEVER send mismatched MIME type)
+    The image API only reliably honours image-to-image when the payload is a
+    PNG data URI. A mismatched MIME type makes the service silently fall back
+    to text-to-image, which shows up as "the result looks nothing like my input".
     """
     from PIL import Image
 
-    # Extract original MIME type for logging
     original_mime = "unknown"
     raw_b64 = image_data
     if image_data.startswith("data:"):
@@ -90,10 +85,6 @@ def _ensure_png_data_uri(image_data: str) -> str:
             original_format, original_mode, original_size, original_mime, len(img_bytes),
         )
 
-        # Mode handling (matching reference implementation):
-        # - RGBA/LA: keep as-is (preserve transparency)
-        # - P with transparency: convert to RGBA
-        # - Everything else: convert to RGB
         if img.mode in ("RGBA", "LA"):
             pass  # preserve transparency
         elif img.mode == "P" and "transparency" in img.info:
@@ -101,188 +92,131 @@ def _ensure_png_data_uri(image_data: str) -> str:
         else:
             img = img.convert("RGB")
 
-        # Re-encode as PNG
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
         png_b64 = base64.b64encode(png_bytes).decode("ascii")
 
         logger.info(
-            "PNG conversion OK: %s/%s → PNG, output bytes=%d, data_uri_len=%d",
-            original_format, original_mode, len(png_bytes), len(png_b64) + 22,
+            "PNG conversion OK: %s/%s -> PNG, output bytes=%d",
+            original_format, original_mode, len(png_bytes),
         )
-
         return f"data:image/png;base64,{png_b64}"
     except Exception as e:
-        # CRITICAL: Do NOT send the original data with a PNG MIME label.
-        # That causes the Agnes API to silently fall back to text2img,
-        # generating an image that looks nothing like the input.
         logger.error(
             "PNG conversion FAILED: %s. Original mime=%s, raw_b64_len=%d. "
-            "Refusing to send mismatched MIME type to avoid silent text2img fallback.",
+            "Refusing to send a mismatched MIME type (silent t2i fallback).",
             e, original_mime, len(raw_b64),
         )
         raise HTTPException(
             status_code=400,
-            detail=f"图片格式转换失败（{original_mime} → PNG），无法安全发送给 API。请尝试使用 PNG 格式的图片。错误: {e}",
+            detail=f"图片格式转换失败（{original_mime} → PNG），无法安全发送给 API。请使用 PNG/JPG 图片。错误: {e}",
         )
-
-
-def _is_4k_size(size: str) -> bool:
-    """Check if the requested size is in the 4K tier (subject to rate limiting)."""
-    return size in ("3840x2160", "2160x3840", "4096x4096")
-
-
-async def _enforce_rate_limit(size: str):
-    """Wait if necessary to respect the 4K tier rate limit (1 req/60s)."""
-    global _last_4k_time
-
-    if not _is_4k_size(size):
-        return
-
-    now = time.monotonic()
-    elapsed = now - _last_4k_time
-    if elapsed < IMAGE_RATE_LIMIT_COOLD:
-        wait = IMAGE_RATE_LIMIT_COOLD - elapsed
-        logger.info("Rate limit: waiting %.1fs before 4K request", wait)
-        await asyncio.sleep(wait)
-
-    _last_4k_time = time.monotonic()
 
 
 # ─── Core API call ─────────────────────────────────────────────────
 
 
-async def _call_image_api(req: ImageGenerateRequest) -> dict:
-    """Call the Agnes Image API and return the raw response data.
+def _build_body(req: ImageGenerateRequest) -> dict:
+    """Build the request body per the Image 2.5 Flash contract."""
+    # response_format belongs in extra_body — a top-level copy is an error.
+    extra: dict = {"response_format": "url"}
 
-    Handles 429 rate limit retries and network error backoff.
-    """
-    # Build request body — send image in BOTH top-level and extra_body
-    # to cover both LiteLLM proxy modes (top-level for httpx direct,
-    # extra_body for SDK/curl compatibility)
-    body: dict = {
+    if req.mode in (req.mode.img2img, req.mode.cartoon) and req.image:
+        # image-to-image / cartoon: PNG data URI in extra_body.image
+        extra["image"] = [_ensure_png_data_uri(req.image)]
+
+    return {
         "model": IMAGE_MODEL,
         "prompt": req.prompt,
-        "size": req.size,
+        "size": req.size,      # tier: 1K / 2K / 3K / 4K
+        "ratio": req.ratio,    # 1:1 / 16:9 / 9:16 / ...
+        "extra_body": extra,
     }
 
-    # img2img: image MUST go in extra_body, NOT top-level body.
-    # The LiteLLM proxy silently strips unknown top-level parameters (like "image"),
-    # causing the API to fall back to text2img. extra_body is the correct channel
-    # for non-standard parameters. Verified by diagnostic: extra_body.image → /i2i/ URL,
-    # top-level image → /t2i/ URL (silent fallback).
-    if req.mode in (req.mode.img2img, req.mode.cartoon) and req.image:
-        png_uri = _ensure_png_data_uri(req.image)
-        body["extra_body"] = {
-            "image": [png_uri],
-            "response_format": "url",
-        }
-        logger.info(
-            "img2img/cartoon request: prompt=%s..., size=%s, image_data_uri_len=%d, body_keys=%s",
-            req.prompt[:50], req.size, len(png_uri), list(body.keys()),
-        )
-    else:
-        logger.info("txt2img request: prompt=%s..., size=%s", req.prompt[:50], req.size)
 
-    # Retry loop: handles 429 (rate limit) and network errors
+async def _call_image_api(req: ImageGenerateRequest) -> dict:
+    """Call the image API, retrying rate limits, queue-full and network errors."""
+    body = _build_body(req)
+
+    logger.info(
+        "Image request: mode=%s, model=%s, size=%s, ratio=%s, has_image=%s, prompt=%s...",
+        req.mode, IMAGE_MODEL, req.size, req.ratio, "image" in body["extra_body"], req.prompt[:50],
+    )
+
     max_retries = IMAGE_MAX_RETRIES
     network_delays = IMAGE_NETWORK_RETRY_DELAYS
-
     last_error = None
+
     for attempt in range(max_retries + 1):
         try:
             async with _no_proxy_client(timeout=240) as client:
-                resp = await client.post(
-                    IMAGE_CREATE_URL,
-                    headers=_get_headers(),
-                    json=body,
-                )
+                resp = await client.post(IMAGE_CREATE_URL, headers=_get_headers(), json=body)
 
-            # 429 = rate limited → wait and retry
+            # 429 = rate limited
             if resp.status_code == 429:
                 if attempt < max_retries:
-                    wait = IMAGE_RATE_LIMIT_COOLD
                     logger.warning(
-                        "Agnes Image API rate limited (429), retry %d/%d after %.0fs...",
-                        attempt + 1,
-                        max_retries,
-                        wait,
+                        "Image API rate limited (429), retry %d/%d after %.0fs",
+                        attempt + 1, max_retries, IMAGE_RATE_LIMIT_COOLD,
                     )
-                    await asyncio.sleep(wait)
+                    await asyncio.sleep(IMAGE_RATE_LIMIT_COOLD)
                     continue
                 raise HTTPException(
                     status_code=429,
-                    detail="图片生成 API 限流（4K 档每分钟仅允许 1 次请求），已自动重试 3 次仍被限流，请等待 1 分钟后重试",
+                    detail=f"图片生成 API 限流，已重试 {max_retries} 次仍被限流，请稍后重试",
                 )
 
-            # 503 = service unavailable (queue full) → wait and retry
+            # 503 = queue full / service unavailable
             if resp.status_code == 503:
                 if attempt < max_retries:
-                    wait = IMAGE_SERVICE_UNAVAIL_COOLD
                     logger.warning(
-                        "Agnes Image API unavailable (503), retry %d/%d after %.0fs...",
-                        attempt + 1,
-                        max_retries,
-                        wait,
+                        "Image API unavailable (503), retry %d/%d after %.0fs",
+                        attempt + 1, max_retries, IMAGE_SERVICE_UNAVAIL_COOLD,
                     )
-                    await asyncio.sleep(wait)
+                    await asyncio.sleep(IMAGE_SERVICE_UNAVAIL_COOLD)
                     continue
                 raise HTTPException(
                     status_code=503,
-                    detail="图片生成服务暂时不可用，已自动重试 3 次仍失败，请稍后重试",
+                    detail=f"图片生成服务繁忙（队列已满），已重试 {max_retries} 次，请稍后重试",
                 )
 
-            # Other non-200 errors
             if resp.status_code != 200:
-                error_detail = "Unknown error"
+                detail = "Unknown error"
                 try:
-                    err_data = resp.json()
-                    error_detail = (
-                        err_data.get("error", {}).get("message")
-                        or err_data.get("detail")
-                        or err_data.get("message")
-                        or str(err_data)
+                    err = resp.json()
+                    detail = (
+                        err.get("error", {}).get("message")
+                        or err.get("message")
+                        or err.get("detail")
+                        or str(err)
                     )
                 except Exception:
-                    error_detail = resp.text[:500]
-                logger.error("Agnes Image API error %d: %s", resp.status_code, error_detail)
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Agnes API error: {error_detail}",
-                )
+                    detail = resp.text[:500]
+                logger.error("Image API error %d: %s | body=%s", resp.status_code, detail, resp.text[:300])
+                raise HTTPException(status_code=resp.status_code, detail=f"Agnes API error: {detail}")
 
-            # Success
             data = resp.json()
-            # Diagnostic: log full response to detect silent t2i fallback
-            result_url = ""
-            revised = ""
-            if isinstance(data.get("data"), list) and len(data["data"]) > 0:
-                result_url = data["data"][0].get("url") or ""
-                revised = data["data"][0].get("revised_prompt") or ""
+            first = (data.get("data") or [{}])[0]
             logger.info(
-                "API response: data_keys=%s, result_url=%s, revised_prompt=%s, "
-                "url_has_t2i=%s, url_has_i2i=%s",
+                "Image API ok: keys=%s url=%s b64=%s route=%s",
                 list(data.keys()),
-                result_url[:120],
-                revised[:100] if revised else "(none)",
-                "/t2i/" in result_url,
-                "/i2i/" in result_url,
+                str(first.get("url"))[:110],
+                "yes" if first.get("b64_json") else "no",
+                "/i2i/" if "/i2i/" in str(first.get("url")) else "/t2i/",
             )
             return data
 
         except HTTPException:
             raise
-        except (httpx.ConnectError, httpx.ReadError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+        except (httpx.ConnectError, httpx.ReadError, httpx.ReadTimeout,
+                httpx.WriteTimeout, httpx.PoolTimeout) as e:
             last_error = e
             if attempt < max_retries and attempt < len(network_delays):
                 delay = network_delays[attempt]
                 logger.warning(
-                    "Network error (%s), retry %d/%d after %ds...",
-                    type(e).__name__,
-                    attempt + 1,
-                    max_retries,
-                    delay,
+                    "Network error (%s), retry %d/%d after %ds",
+                    type(e).__name__, attempt + 1, max_retries, delay,
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -291,21 +225,19 @@ async def _call_image_api(req: ImageGenerateRequest) -> dict:
                 detail=f"网络错误，无法连接 Agnes API: {type(e).__name__}: {e}",
             )
 
-    # Should not reach here
     raise HTTPException(status_code=500, detail=f"Image API call failed: {last_error}")
 
 
 async def _download_and_save(image_url: str) -> str:
-    """Download image from URL and save to local uploads directory.
+    """Download the generated image and store it in uploads/.
 
-    Returns the local URL path (e.g., "/uploads/generated-xxx.png").
-    NOTE: Do NOT pass Authorization headers — image URLs are on Google Cloud Storage.
+    Output URLs live on Agnes storage (platform-outputs.agnes-ai.space), so the
+    API bearer token must NOT be forwarded — those hosts reject it.
     """
     filename = f"generated-{uuid.uuid4().hex[:12]}.png"
     filepath = UPLOADS_DIR / filename
 
     async with _no_proxy_client(timeout=60) as client:
-        # No auth headers — GCS doesn't recognize Agnes Bearer tokens
         resp = await client.get(image_url)
         if resp.status_code != 200:
             raise HTTPException(
@@ -322,54 +254,32 @@ async def _download_and_save(image_url: str) -> str:
 
 
 async def generate_image(req: ImageGenerateRequest) -> ImageGenerateResponse:
-    """Generate an image using the Agnes Image API.
-
-    Flow:
-    1. (img2img) Convert input image to PNG data URI
-    2. Enforce rate limit for 4K tier
-    3. Call POST /v1/images/generations (synchronous — returns result directly)
-    4. Download the result image from GCS URL
-    5. Save to local uploads/ directory
-    6. Return local URL path
-    """
-    # Rate limiting for 4K sizes
-    await _enforce_rate_limit(req.size)
-
-    # Call the API
+    """Generate an image (text-to-image or image-to-image) and store it locally."""
     data = await _call_image_api(req)
 
-    # Parse response — result is in data[0]
-    results = data.get("data", [])
+    results = data.get("data") or []
     if not results:
-        raise HTTPException(
-            status_code=500,
-            detail="Agnes Image API returned no results",
-        )
+        raise HTTPException(status_code=500, detail="Agnes Image API returned no results")
 
     item = results[0]
-
-    # Image can be returned as a URL or as base64
     image_url = item.get("url")
     b64_json = item.get("b64_json")
     revised_prompt = item.get("revised_prompt") or ""
 
     if b64_json:
-        # Save base64 directly to disk
         filename = f"generated-{uuid.uuid4().hex[:12]}.png"
         filepath = UPLOADS_DIR / filename
         filepath.write_bytes(base64.b64decode(b64_json))
         local_url = f"/uploads/{filename}"
         logger.info("Image saved from b64_json to %s", filepath)
     elif image_url:
-        # Download from GCS URL
         local_url = await _download_and_save(image_url)
     else:
-        raise HTTPException(
-            status_code=500,
-            detail="Agnes Image API returned no image URL or base64 data",
-        )
+        raise HTTPException(status_code=500, detail="Agnes Image API returned no image URL or base64 data")
 
     return ImageGenerateResponse(
         image_url=local_url,
         revised_prompt=revised_prompt,
+        size=req.size,
+        ratio=req.ratio,
     )

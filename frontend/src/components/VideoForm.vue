@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useVideoStore } from "../stores/videoStore";
-import type { AspectRatio, GenerateMode } from "../api/video";
+import type { GenerateMode, VideoSize } from "../api/video";
 import PromptEngineer from "./PromptEngineer.vue";
 
 const store = useVideoStore();
@@ -9,19 +9,32 @@ const store = useVideoStore();
 const showAdvanced = ref(false);
 const dragOver = ref(false);
 
-const aspectOptions: { label: string; value: AspectRatio }[] = [
-  { label: "16:9", value: "16:9" },
-  { label: "9:16", value: "9:16" },
-  { label: "1:1", value: "1:1" },
-  { label: "4:3", value: "4:3" },
-];
+const durationPresets = [4, 5, 6, 8, 10, 12];
 
-const durationPresets = [3, 5, 10, 17];
+const sizeLabels: Record<VideoSize, string> = {
+  "720P": "720P 标准",
+  "1080P": "1080P 高清",
+  "1K": "1K",
+  "2K": "2K 超清",
+};
 
 const modeTabs: { label: string; value: GenerateMode }[] = [
   { label: "文生视频", value: "txt2vid" },
   { label: "图生视频", value: "img2vid" },
 ];
+
+// Only offer what the active model accepts (Flash = 720P only).
+const sizeOptions = computed(() =>
+  store.availableSizes.map((s) => ({ value: s, label: sizeLabels[s] ?? s }))
+);
+
+const flashOnlyHint = computed(
+  () => store.availableSizes.length === 1 && store.model.includes("flash")
+);
+
+onMounted(() => {
+  store.loadConfig();
+});
 
 function onDrop(e: DragEvent) {
   dragOver.value = false;
@@ -112,29 +125,55 @@ function canGenerate(): boolean {
       <label class="form-label">宽高比</label>
       <div class="ratio-group">
         <button
-          v-for="opt in aspectOptions"
-          :key="opt.value"
-          :class="['ratio-btn', { active: store.aspectRatio === opt.value }]"
-          @click="store.aspectRatio = opt.value"
+          v-for="r in store.availableRatios"
+          :key="r"
+          :class="['ratio-btn', { active: store.aspectRatio === r }]"
+          @click="store.aspectRatio = r"
         >
-          {{ opt.label }}
+          {{ r }}
         </button>
       </div>
     </div>
 
     <!-- Duration -->
     <div class="form-section">
-      <label class="form-label">视频时长</label>
+      <label class="form-label">
+        视频时长
+        <span class="char-count">4–12 秒</span>
+      </label>
       <div class="duration-group">
         <button
           v-for="d in durationPresets"
           :key="d"
-          :class="['duration-btn', { active: store.duration === d }]"
-          @click="store.duration = d"
+          :disabled="d < store.minSeconds || d > store.maxSeconds"
+          :class="['duration-btn', { active: store.seconds === d }]"
+          @click="store.seconds = d"
         >
           {{ d }}秒
         </button>
       </div>
+    </div>
+
+    <!-- Resolution tier -->
+    <div class="form-section">
+      <label class="form-label">
+        分辨率
+        <span v-if="store.model" class="char-count">{{ store.model }}</span>
+      </label>
+      <div class="ratio-group">
+        <button
+          v-for="opt in sizeOptions"
+          :key="opt.value"
+          :class="['ratio-btn', { active: store.size === opt.value }]"
+          @click="store.size = opt.value"
+        >
+          {{ opt.label }}
+        </button>
+      </div>
+      <p v-if="flashOnlyHint" class="upload-hint">
+        当前为 Flash 模型，仅支持 720P 且限时免费；如需 1080P/2K，请将后端
+        <code>AGNES_VIDEO_MODEL</code> 改为 <code>agnes-video-2.5</code>（按秒计费）。
+      </p>
     </div>
 
     <!-- Advanced Settings -->
@@ -154,17 +193,6 @@ function canGenerate(): boolean {
 
     <div v-show="showAdvanced" class="advanced-panel">
       <div class="form-row">
-        <label class="form-label">推理步数: {{ store.inferenceSteps }}</label>
-        <input
-          type="range"
-          v-model.number="store.inferenceSteps"
-          min="1"
-          max="100"
-          class="slider"
-        />
-      </div>
-
-      <div class="form-row">
         <label class="form-label">随机种子（留空为随机）</label>
         <input
           type="number"
@@ -175,7 +203,7 @@ function canGenerate(): boolean {
       </div>
 
       <div class="form-row">
-        <label class="form-label">负面提示词</label>
+        <label class="form-label">负面提示词（附加到提示词末尾）</label>
         <textarea
           v-model="store.negativePrompt"
           class="prompt-input"
@@ -356,6 +384,7 @@ function canGenerate(): boolean {
 .ratio-group,
 .duration-group {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 

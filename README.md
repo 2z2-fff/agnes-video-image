@@ -1,29 +1,40 @@
-# Agnes Video Generator MVP
+# Agnes AI Generator（图片 + 视频）
 
-基于 Agnes Video V2.0 API 的视频生成应用，支持文生视频和图生视频。
+基于 Agnes AI 官方 API 的图片与视频生成应用：Vue 3 + Vite 前端，FastAPI 后端。
+
+- 图片：`agnes-image-2.5-flash`（文生图 / 图生图 / 卡通图像生成，所有档位当前免费）
+- 视频：`agnes-video-2.5-flash`（默认，720P，当前 $0/s）/ `agnes-video-2.5`（720P–2K，按秒计费）
+
+> 项目已从旧版 **Agnes Video V2.0** 参数体系（`width/height/num_frames/frame_rate`）迁移到
+> **Agnes Video 2.5** 的 OpenAI Videos 兼容接口。旧参数会被服务端以 `400` 拒绝，
+> 详见 [`FIXES.md`](./FIXES.md)。
 
 ## 快速开始
 
-### 1. 配置后端
+### 1. 后端
 
 ```bash
 cd backend
 pip install -r requirements.txt
 ```
 
-编辑 `backend/.env`，填入你的 Agnes API Key：
+编辑 `backend/.env`：
 
-```
-AGNES_API_KEY=your_actual_api_key
+```ini
+AGNES_API_KEY=sk-your-key
+AGNES_BASE_URL=https://apihub.agnes-ai.com
+AGNES_VIDEO_MODEL=agnes-video-2.5-flash   # 或 agnes-video-2.5（付费，支持 1080P/1K/2K）
+AGNES_IMAGE_MODEL=agnes-image-2.5-flash
+UPLOADS_DIR=                              # 可选：生成图片的保存目录，默认 backend/uploads
 ```
 
-启动后端：
+启动：
 
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
-### 2. 启动前端
+### 2. 前端
 
 ```bash
 cd frontend
@@ -31,64 +42,65 @@ npm install
 npm run dev
 ```
 
-前端运行在 `http://localhost:5173`。
+前端运行在 <http://localhost:5173>（`/api` 与 `/uploads` 已代理到 8000 端口）。
 
 ### 3. 使用
 
-1. 选择模式：文生视频 或 图生视频
-2. 输入视频提示词（英文效果更佳）
-3. 如选择图生视频，上传一张参考图片
-4. 选择宽高比和视频时长
-5. 点击"生成视频"
-6. 等待生成完成（1-5 分钟），视频自动播放
+1. 选择模式：文生视频 / 图生视频（图片页：文生图 / 图生图 / 卡通）
+2. 输入提示词，可选用 Prompt 工程助手
+3. 选择宽高比（21:9 / 16:9 / 4:3 / 1:1 / 3:4 / 9:16）、时长（4–12 秒）、分辨率档位
+4. 点击生成，等待队列与生成完成，视频自动播放
 
-## 功能
+## 参数对照（官方 API）
 
-- **文生视频**：根据文本提示词生成视频
-- **图生视频**：上传图片并添加运动描述生成动画
-- **多种宽高比**：16:9、9:16、1:1、4:3
-- **时长选择**：3秒、5秒、10秒、18秒
-- **高级参数**：推理步数、随机种子、负面提示词
-- **视频流播放**：后端代理流式传输，支持拖动进度条
-- **视频下载**：支持下载生成的视频文件
+| 项目 | 图片 API | 视频 API |
+| --- | --- | --- |
+| 端点 | `POST /v1/images/generations` | `POST /v1/videos` + `GET /agnesapi` |
+| 模型 | `agnes-image-2.5-flash` | `agnes-video-2.5-flash` / `agnes-video-2.5` |
+| 尺寸 | `size`: `1K/2K/3K/4K` + `ratio` | `size`: `720P/1080P/1K/2K` + `aspect_ratio` |
+| 时长 | — | `seconds`: 字符串 `"4"`–`"12"` |
+| 模式 | `extra_body.image[]` 表示图生图 | `mode`: `text` / `keyframe` / `reference` |
+| 参考图 | URL 或 Data URI Base64 | `first_frame`（图生视频，实测可用 Data URI） |
 
-## 技术栈
+## API 端点（本项目）
 
-- 前端：Vue 3 + Vite + TypeScript + Pinia + Axios
-- 后端：Python FastAPI + httpx + Pydantic
-- API：Agnes Video V2.0 (`agnes-video-v2.0`)
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/config` | 当前模型与可用参数（前端据此渲染选项） |
+| POST | `/api/generate` | 提交视频任务（`txt2vid` / `img2vid`） |
+| GET | `/api/generate/{id}` | 查询状态 |
+| GET | `/api/generate/{id}/wait` | 长轮询等待完成 |
+| GET | `/api/generate/{id}/stream` | 视频流代理（支持 Range） |
+| GET | `/api/generate/{id}/download` | 下载视频 |
+| POST | `/api/image/generate` | 图片生成（`txt2img` / `img2img` / `cartoon`） |
+
+## 测试
+
+```bash
+cd backend
+python -u scripts/e2e_test.py          # 端到端：图生图 + 文生视频 + 图生视频
+python -u scripts/probe_api.py fast    # 接口探测：模型/参数是否被接受
+```
 
 ## 项目结构
 
 ```
 Qoderwork/
-├── backend/              # FastAPI 后端
-│   ├── .env              # API Key 配置
-│   ├── requirements.txt
-│   └── app/
-│       ├── main.py       # 应用入口
-│       ├── config.py     # 环境配置
-│       ├── schemas.py    # 数据模型
-│       ├── services/
-│       │   └── agnes_video.py  # Agnes API 封装
-│       └── api/
-│           └── video.py  # REST 端点
-├── frontend/             # Vue3 前端
-│   ├── src/
-│   │   ├── api/          # Axios API 层
-│   │   ├── stores/       # Pinia 状态管理
-│   │   ├── views/        # 页面
-│   │   └── components/   # 组件
-│   └── ...
-└── README.md
+├── backend/
+│   ├── .env                    # API Key 与模型配置
+│   ├── app/
+│   │   ├── config.py           # 模型、档位、比例、重试等常量
+│   │   ├── schemas.py          # 请求/响应模型（含校验）
+│   │   ├── services/
+│   │   │   ├── agnes_image.py  # 图片 API 封装
+│   │   │   └── agnes_video.py  # 视频 API 封装（创建/轮询/代理）
+│   │   └── api/                # REST 端点
+│   └── scripts/                # 探测与端到端测试脚本
+├── frontend/src/               # Vue 3 + Pinia + Axios
+└── FIXES.md                    # 本次修复记录
 ```
 
-## API 端点
+## 技术栈
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/generate` | 提交生成任务 |
-| GET | `/api/generate/{id}` | 查询状态 |
-| GET | `/api/generate/{id}/wait` | 长轮询等待完成 |
-| GET | `/api/generate/{id}/stream` | 视频流代理（支持 Range） |
-| GET | `/api/generate/{id}/download` | 下载视频 |
+- 前端：Vue 3 + Vite + TypeScript + Pinia + Axios
+- 后端：Python FastAPI + httpx + Pydantic v2 + Pillow

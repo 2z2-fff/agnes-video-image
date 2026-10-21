@@ -1,338 +1,371 @@
-"""Agnes Video V2.0 API service — core wrapper for all video generation operations.
+"""Agnes Video 2.5 service — text-to-video and keyframe (image-to-video).
 
-Handles: task creation, status querying, polling, video stream/download proxy.
-All httpx calls bypass system proxy to avoid silent failures.
+Official contract (https://agnes-ai.com/zh-Hans/docs/agnes-video-25):
+
+    POST {base}/v1/videos                      create task -> {video_id, task_id, ...}
+    GET  {base}/agnesapi?video_id=&model_name= poll task   -> {status, progress, url}
+
+Request body: ``model``, ``prompt``, ``mode`` (text|keyframe|reference),
+``seconds`` ("4"-"12"), ``size`` (720P|1080P|1K|2K), ``aspect_ratio``, ``seed``.
+
+The API rejects (HTTP 400) the pre-2.5 parameters ``width``, ``height``,
+``fps``, ``num_frames``, ``quality`` and ``num_inference_steps``. It also
+rejects pixel strings for ``size`` and ``aspect_ratio: "auto"``.
+
+All httpx calls bypass the system proxy to avoid silent failures.
 """
 
 import asyncio
-import time
 import logging
+import time
+
 import httpx
 from fastapi import HTTPException
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import Response, StreamingResponse
 
 from app.config import (
     AGNES_API_KEY,
     CREATE_VIDEO_URL,
-    QUERY_VIDEO_URL,
-    AGNES_MODEL,
-    ASPECT_MAP,
+    FLASH_VIDEO_SIZES,
     POLL_INTERVAL_SEC,
     POLL_TIMEOUT_SEC,
+    QUERY_VIDEO_URL,
+    VIDEO_MODEL,
 )
 from app.schemas import GenerateRequest, TaskResponse
 from app.services.agnes_image import _ensure_png_data_uri
 
 logger = logging.getLogger(__name__)
 
+# Queue-full handling: the video service allows a single concurrent task and
+# answers new requests with HTTP 503 / code "video_queue_full". Observed waits
+# of up to ~7 minutes, so the retry budget is deliberately generous.
+QUEUE_RETRY_ATTEMPTS = 30
+QUEUE_RETRY_DELAY_SEC = 15
+
+# Status-query transport retries (the API sometimes drops the connection
+# mid-poll without returning a response).
+QUERY_TRANSPORT_ATTEMPTS = 3
+
+# How many consecutive failed status queries the polling loop tolerates
+# before giving up on an otherwise healthy task.
+POLL_MAX_CONSECUTIVE_ERRORS = 20
+
+# Extra backoff when the status endpoint answers 429 (observed under load).
+RATE_LIMIT_BACKOFF_SEC = 10
+
 
 # ─── Internal helpers ──────────────────────────────────────────────
 
 
 def _no_proxy_client(**kwargs) -> httpx.AsyncClient:
-    """Create an httpx client that bypasses system proxy.
-
-    System proxy causes silent failures (no error, no response) when
-    calling the Agnes API. This is the #1 gotcha.
-    """
+    """Create an httpx client that bypasses the system proxy."""
     transport = httpx.AsyncHTTPTransport(proxy=None)
     return httpx.AsyncClient(transport=transport, **kwargs)
 
 
 def _get_headers() -> dict:
-    """Build authorization headers for Agnes API."""
+    """Build authorization headers for the Agnes API."""
     return {
         "Authorization": f"Bearer {AGNES_API_KEY}",
         "Content-Type": "application/json",
     }
 
 
-def _frames_for_duration(seconds: float, fps: int = 24) -> int:
-    """Convert desired duration in seconds to a valid num_frames value.
+def _api_mode(req: GenerateRequest) -> str:
+    """Map the UI mode onto the API's `mode` value."""
+    return "keyframe" if req.mode == req.mode.img2vid else "text"
 
-    Agnes API requires: num_frames = 8n + 1.
-    Resolution-tier limits (our ASPECT_MAP falls in 720p tier):
-      1080p: max 169 frames (~7s @24fps)
-      720p:  max 409 frames (~17s @24fps)
-      480p:  max 961 frames (~40s @24fps)
+
+def _build_prompt(req: GenerateRequest) -> str:
+    """Compose the final prompt.
+
+    Video 2.5 has no ``negative_prompt`` field, so any negative prompt is
+    folded into the prompt as an explicit "avoid" instruction.
     """
-    MAX_N = 51  # 8*51+1 = 409 (720p tier limit)
-    target = int(seconds * fps)
-    n = round((target - 1) / 8)
-    n = max(1, min(n, MAX_N))
-    return 8 * n + 1
+    prompt = req.prompt.strip()
+    negative = (req.negative_prompt or "").strip()
+    if negative:
+        prompt = f"{prompt}\n\nAvoid the following: {negative}"
+    return prompt
 
 
-def _strip_data_uri(image_str: str) -> str:
-    """Strip data URI prefix if present, returning pure base64.
+def _validate_model_and_size(req: GenerateRequest) -> None:
+    """Reject combinations the API will refuse, with an actionable message."""
+    if VIDEO_MODEL == "agnes-video-2.5-flash" and req.size not in FLASH_VIDEO_SIZES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{VIDEO_MODEL} 仅支持 size=720P（请求为 {req.size}）。"
+                "如需 1080P/1K/2K，请把后端 .env 中的 AGNES_VIDEO_MODEL 设为 agnes-video-2.5（按秒计费）。"
+            ),
+        )
 
-    e.g. "data:image/png;base64,AAAA..." → "AAAA..."
+
+def _first_frame_value(image: str) -> str:
+    """Normalise the uploaded image into the `first_frame` value.
+
+    The image is re-encoded to PNG (the API is picky about format) and passed
+    as a data URI, so no public hosting is required for image-to-video.
     """
-    if image_str.startswith("data:"):
-        # Find the base64 marker
-        idx = image_str.find(";base64,")
-        if idx != -1:
-            return image_str[idx + 8 :]
-    return image_str
+    png_uri = _ensure_png_data_uri(image)
+    logger.info("keyframe first_frame: png data URI, length=%d", len(png_uri))
+    return png_uri
 
 
-def _extract_task_id(data: dict) -> str:
-    """Extract task ID from Agnes API response, handling multiple field names."""
+def _build_body(req: GenerateRequest) -> dict:
+    """Build the create-task body for Video 2.5."""
+    body: dict = {
+        "model": VIDEO_MODEL,
+        "prompt": _build_prompt(req),
+        "mode": _api_mode(req),
+        "seconds": str(req.seconds),   # API wants a string
+        "size": req.size,
+        "aspect_ratio": req.aspect_ratio,
+    }
+
+    if req.mode == req.mode.img2vid:
+        if not req.image:
+            raise HTTPException(status_code=400, detail="img2vid 模式需要上传一张参考图片")
+        body["first_frame"] = _first_frame_value(req.image)
+
+    if req.seed is not None:
+        body["seed"] = req.seed
+
+    return body
+
+
+def _extract_video_id(data: dict) -> str:
+    """Extract the polling ID. `video_id` is the documented query key."""
     for key in ("video_id", "id", "task_id"):
         val = data.get(key)
         if val:
             return str(val)
-    raise HTTPException(status_code=500, detail="No task ID found in Agnes API response")
+    raise HTTPException(status_code=500, detail="No video_id in Agnes API response")
+
+
+def _extract_error_message(resp: httpx.Response) -> tuple[str, str]:
+    """Return (code, message) from an error response."""
+    code = ""
+    message = "Unknown error"
+    try:
+        data = resp.json()
+        code = str(data.get("code") or "")
+        err = data.get("error")
+        if isinstance(err, dict):
+            message = err.get("message") or str(err)
+        else:
+            message = data.get("message") or data.get("detail") or str(data)
+    except Exception:
+        message = resp.text[:300]
+    return code, message
 
 
 # ─── Task lifecycle ────────────────────────────────────────────────
 
 
-async def create_video_task(req: GenerateRequest) -> str:
-    """Submit a video generation task to Agnes API. Returns the task ID.
-
-    Endpoint: POST https://apihub.agnes-ai.com/v1/videos
-    """
-    # Resolve resolution from aspect ratio
-    width, height = ASPECT_MAP.get(req.aspect_ratio, (1152, 648))
-
-    # Calculate valid num_frames from desired duration
-    num_frames = _frames_for_duration(req.duration, req.fps)
-
-    # Build request body
-    body: dict = {
-        "model": AGNES_MODEL,
-        "prompt": req.prompt,
-        "width": width,
-        "height": height,
-        "num_frames": num_frames,
-        "frame_rate": req.fps,
-    }
-
-    # img2vid: image MUST go in extra_body.image, NOT top-level body.
-    # The LiteLLM proxy strips unknown top-level parameters (like "image"),
-    # causing img2vid requests to fail with 404 NotFoundError.
-    # Fix: move image to extra_body.image (array of pure base64 strings).
-    # Diagnostic test (2026-07-03) confirmed: extra_body.image with pure base64 → 200 OK.
-    # The image is converted to PNG first (handles WebP/JPEG → PNG for format compatibility),
-    # then the data URI prefix is stripped to get pure base64.
-    if req.mode == req.mode.img2vid and req.image:
-        # Step 1: Convert to PNG data URI (handles any format → PNG)
-        png_uri = _ensure_png_data_uri(req.image)
-        # Step 2: Strip data URI prefix → pure base64 (confirmed working format)
-        pure_b64 = _strip_data_uri(png_uri)
-        body["extra_body"] = {
-            "image": [pure_b64],  # array of pure base64 strings
-        }
-        logger.info(
-            "img2vid request: prompt=%s..., image_b64_len=%d, body_keys=%s",
-            req.prompt[:50], len(pure_b64), list(body.keys()),
-        )
-
-    # Optional parameters (only add if non-empty/non-None)
-    if req.negative_prompt:
-        body["negative_prompt"] = req.negative_prompt
-    if req.seed is not None:
-        body["seed"] = req.seed
-    if req.num_inference_steps and req.num_inference_steps != 25:
-        body["num_inference_steps"] = req.num_inference_steps
+async def create_video_task(req: GenerateRequest) -> dict:
+    """Submit a video task. Returns task metadata including the polling ID."""
+    _validate_model_and_size(req)
+    body = _build_body(req)
 
     logger.info(
-        "Creating video task: mode=%s, prompt=%s..., %dx%d, %d frames @ %d fps, has_extra_body=%s",
-        req.mode,
-        req.prompt[:50],
-        width,
-        height,
-        num_frames,
-        req.fps,
-        "extra_body" in body,
+        "Create video: model=%s mode=%s size=%s %ss %s, keys=%s, prompt=%s...",
+        VIDEO_MODEL, body["mode"], req.size, req.seconds, req.aspect_ratio,
+        list(body.keys()), req.prompt[:60],
     )
 
-    # Agnes API allows only 1 concurrent task. On 503 "Service busy", retry with backoff.
-    MAX_503_RETRIES = 5
-    RETRY_DELAY_SEC = 15
+    async with _no_proxy_client(timeout=180) as client:
+        for attempt in range(QUEUE_RETRY_ATTEMPTS + 1):
+            resp = await client.post(CREATE_VIDEO_URL, headers=_get_headers(), json=body)
 
-    async with _no_proxy_client(timeout=120) as client:
-        for attempt in range(MAX_503_RETRIES + 1):
-            resp = await client.post(
-                CREATE_VIDEO_URL,
-                headers=_get_headers(),
-                json=body,
-            )
+            if resp.status_code == 200:
+                data = resp.json()
+                video_id = _extract_video_id(data)
+                logger.info(
+                    "Task created: video_id=%s status=%s seconds=%s size=%s",
+                    video_id, data.get("status"), data.get("seconds"), data.get("size"),
+                )
+                return {
+                    "video_id": video_id,
+                    "status": data.get("status", "queued"),
+                    "model": VIDEO_MODEL,
+                    "size": str(data.get("size") or req.size),
+                    "seconds": req.seconds,
+                }
 
-            # 503 = service busy (another task still running) → wait and retry
-            if resp.status_code == 503:
-                if attempt < MAX_503_RETRIES:
+            code, message = _extract_error_message(resp)
+
+            # 503 / video_queue_full → the queue is busy; wait and retry.
+            if resp.status_code == 503 or code == "video_queue_full":
+                if attempt < QUEUE_RETRY_ATTEMPTS:
                     logger.warning(
-                        "Agnes API busy (503), retry %d/%d after %ds...",
-                        attempt + 1,
-                        MAX_503_RETRIES,
-                        RETRY_DELAY_SEC,
+                        "Video queue full (attempt %d/%d), retry in %ds",
+                        attempt + 1, QUEUE_RETRY_ATTEMPTS, QUEUE_RETRY_DELAY_SEC,
                     )
-                    await asyncio.sleep(RETRY_DELAY_SEC)
+                    await asyncio.sleep(QUEUE_RETRY_DELAY_SEC)
                     continue
-                # Max retries exhausted
                 raise HTTPException(
                     status_code=503,
-                    detail="Agnes API 服务繁忙（可能有其他任务正在运行），已自动重试 5 次仍无法创建任务，请等待 1-2 分钟后重试",
+                    detail=(
+                        "Agnes 视频队列已满（同一时间仅允许 1 个任务），"
+                        f"已等待约 {QUEUE_RETRY_ATTEMPTS * QUEUE_RETRY_DELAY_SEC // 60} 分钟仍未空闲。"
+                        "请稍后重试，或等待其他任务完成。"
+                    ),
                 )
 
-            # Other non-200 errors: no retry
-            if resp.status_code != 200:
-                error_detail = "Unknown error"
-                try:
-                    err_data = resp.json()
-                    # LiteLLM returns errors nested as {"error": {"message": "...", "type": null, "param": null, "code": "404"}}
-                    # Try nested error.message first, then flat fields
-                    err_obj = err_data.get("error")
-                    if isinstance(err_obj, dict):
-                        error_detail = err_obj.get("message") or str(err_obj)
-                    else:
-                        error_detail = (
-                            err_data.get("detail")
-                            or err_data.get("message")
-                            or str(err_data)
-                        )
-                except Exception:
-                    error_detail = resp.text[:500]
-                logger.error(
-                    "Agnes API error %d: %s | Full response body: %s | Request body keys: %s, has_extra_body: %s",
-                    resp.status_code,
-                    error_detail,
-                    resp.text[:500],
-                    list(body.keys()),
-                    "extra_body" in body,
-                )
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Agnes API error: {error_detail}",
-                )
+            # 429 → back off once and retry
+            if resp.status_code == 429 and attempt < QUEUE_RETRY_ATTEMPTS:
+                await asyncio.sleep(30)
+                continue
 
-            # Success
-            break
+            logger.error(
+                "Video create failed: HTTP %d code=%s message=%s | body=%s",
+                resp.status_code, code, message, resp.text[:400],
+            )
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"Agnes API error ({code or resp.status_code}): {message}",
+            )
 
-    data = resp.json()
-    logger.info(
-        "API response: status_code=%d, response_keys=%s, body_keys=%s",
-        resp.status_code,
-        list(data.keys()),
-        list(body.keys()),
-    )
-    task_id = _extract_task_id(data)
-    logger.info("Task created: %s", task_id)
-    return task_id
+    raise HTTPException(status_code=500, detail="Video task creation failed")
 
 
-async def query_task_status(task_id: str) -> TaskResponse:
-    """Query current status of a video task.
+async def query_task_status(video_id: str) -> TaskResponse:
+    """Query a task's current status.
 
-    Endpoint: GET https://apihub.agnes-ai.com/agnesapi?video_id=<task_id>
+    ``model_name`` is always sent: the docs require it for every mode except
+    plain text, and it is the recommended polling form for all modes.
+
+    Transient transport failures (the API occasionally drops the connection
+    without a response) are retried here — otherwise a single network blip
+    would kill a long-running generation.
     """
-    async with _no_proxy_client(timeout=30) as client:
-        resp = await client.get(
-            QUERY_VIDEO_URL,
-            params={"video_id": task_id},
-            headers=_get_headers(),
-        )
+    last_error: Exception | None = None
+
+    for attempt in range(QUERY_TRANSPORT_ATTEMPTS + 1):
+        try:
+            async with _no_proxy_client(timeout=30) as client:
+                resp = await client.get(
+                    QUERY_VIDEO_URL,
+                    params={"video_id": video_id, "model_name": VIDEO_MODEL},
+                    headers=_get_headers(),
+                )
+            break
+        except httpx.TransportError as e:  # timeouts, disconnects, protocol errors
+            last_error = e
+            if attempt < QUERY_TRANSPORT_ATTEMPTS:
+                logger.warning(
+                    "Status query transport error (%s), retry %d/%d",
+                    type(e).__name__, attempt + 1, QUERY_TRANSPORT_ATTEMPTS,
+                )
+                await asyncio.sleep(2)
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail=f"查询任务状态时网络中断: {type(e).__name__}。任务仍在服务端运行，请稍后用同一 task_id 重试查询。",
+            )
+    else:  # pragma: no cover - loop always breaks or raises
+        raise HTTPException(status_code=502, detail=str(last_error))
 
     if resp.status_code != 200:
+        code, message = _extract_error_message(resp)
+        logger.error("Query failed: HTTP %d code=%s %s", resp.status_code, code, message)
         raise HTTPException(
             status_code=resp.status_code,
-            detail=f"Failed to query task status: {resp.text[:200]}",
+            detail=f"查询任务状态失败 ({code or resp.status_code}): {message}",
         )
 
     data = resp.json()
     status = data.get("status", "unknown")
 
-    # Diagnostic: log all response keys when completed, to find the video URL field
-    if status == "completed":
-        logger.info("Task completed. Response keys: %s", list(data.keys()))
-        # Log all non-None values that could be URLs
-        for k, v in data.items():
-            if v is not None and isinstance(v, str) and (v.startswith("http") or "url" in k.lower() or "video" in k.lower()):
-                logger.info("  Field '%s' = %s", k, v[:120])
+    # The result URL is the top-level `url` field (documented).
+    video_url = data.get("url") or data.get("video_url") or data.get("output_url")
 
-    # Extract video URL — check multiple possible field names
-    video_url = (
-        data.get("remixed_from_video_id")
-        or data.get("video_url")
-        or data.get("url")
-        or data.get("output_url")
-        or data.get("result_url")
-        or data.get("download_url")
-    )
-
-    # If still None and status is completed, log the full response for debugging
     if status == "completed" and not video_url:
-        logger.warning("Task completed but no video URL found! Full response: %s", str(data)[:1000])
+        logger.warning("Task completed without a URL. Full response: %s", str(data)[:800])
+    if status == "failed":
+        logger.error("Task failed: %s", data.get("error"))
 
-    # Extract duration
     duration = None
-    seconds_raw = data.get("seconds")
-    if seconds_raw:
+    if data.get("seconds") is not None:
         try:
-            duration = float(seconds_raw)
-        except (ValueError, TypeError):
-            pass
+            duration = float(data["seconds"])
+        except (TypeError, ValueError):
+            duration = None
 
     error = data.get("error")
+    if isinstance(error, dict):
+        error = error.get("message") or str(error)
 
     return TaskResponse(
-        task_id=task_id,
+        task_id=video_id,
         status=status,
         video_url=video_url,
         duration=duration,
+        progress=data.get("progress"),
         error=error,
     )
 
 
 async def poll_until_complete(
-    task_id: str,
+    video_id: str,
     timeout: int = POLL_TIMEOUT_SEC,
     interval: int = POLL_INTERVAL_SEC,
 ) -> TaskResponse:
-    """Poll task status until completed, failed, or timeout.
+    """Poll until the task completes, fails, or the timeout elapses.
 
-    Returns the final TaskResponse. If timeout, returns with status="timeout".
+    A few consecutive query failures are tolerated: the generation keeps
+    running server-side, so aborting on a transient network error would throw
+    away a paid/queued task.
     """
     start = time.monotonic()
+    consecutive_errors = 0
 
     while True:
-        result = await query_task_status(task_id)
+        try:
+            result = await query_task_status(video_id)
+            consecutive_errors = 0
+        except HTTPException as e:
+            if e.status_code in (429, 502, 503, 504) and consecutive_errors < POLL_MAX_CONSECUTIVE_ERRORS:
+                consecutive_errors += 1
+                # 429 on this endpoint is load-based, not per-second pacing:
+                # back off harder so the loop does not burn its error budget.
+                wait = RATE_LIMIT_BACKOFF_SEC if e.status_code == 429 else interval
+                logger.warning(
+                    "Status query failed (%s), %d/%d tolerated, retry in %ds",
+                    e.status_code, consecutive_errors, POLL_MAX_CONSECUTIVE_ERRORS, wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+            raise
 
         if result.status == "completed":
-            logger.info("Task %s completed: %s", task_id, result.video_url)
+            logger.info("Task %s completed in %ds: %s",
+                        video_id, int(time.monotonic() - start), result.video_url)
             return result
 
         if result.status == "failed":
-            logger.error("Task %s failed: %s", task_id, result.error)
             return result
 
         elapsed = time.monotonic() - start
         if elapsed >= timeout:
-            logger.warning("Task %s timed out after %ds", task_id, int(elapsed))
+            logger.warning("Task %s timed out after %ds", video_id, int(elapsed))
             return TaskResponse(
-                task_id=task_id,
+                task_id=video_id,
                 status="timeout",
                 error=f"Timed out after {int(elapsed)} seconds",
             )
 
-        # Wait before next poll
         await asyncio.sleep(interval)
 
 
 # ─── Video proxy ───────────────────────────────────────────────────
 
 
-async def proxy_video_stream(task_id: str, range_header: str | None) -> StreamingResponse:
-    """Proxy video stream from Agnes storage to browser, supporting HTTP Range.
-
-    This is necessary because:
-    1. Agnes video URLs have CORS restrictions (can't play directly in <video>)
-    2. Browser needs Range support for seeking/scrubbing
-    """
-    # First, get the actual video URL from task status
-    status = await query_task_status(task_id)
+async def proxy_video_stream(video_id: str, range_header: str | None) -> StreamingResponse:
+    """Proxy the video with HTTP Range support (needed for seeking in <video>)."""
+    status = await query_task_status(video_id)
     if status.status != "completed" or not status.video_url:
         raise HTTPException(
             status_code=400,
@@ -340,46 +373,33 @@ async def proxy_video_stream(task_id: str, range_header: str | None) -> Streamin
         )
 
     video_url = status.video_url
-
-    # Use a single client for both HEAD and streaming GET
-    client = _no_proxy_client(timeout=None)  # no timeout for streaming
+    client = _no_proxy_client(timeout=None)
 
     try:
-        # HEAD request to get content metadata
-        # NOTE: Do NOT pass Agnes auth headers — the video URL is on Google Cloud Storage,
-        # not apihub.agnes-ai.com. Sending the Agnes Bearer token causes 401.
+        # No Agnes auth headers: output URLs are on Agnes storage and reject the token.
         head_resp = await client.head(video_url)
         content_length = int(head_resp.headers.get("content-length", 0))
         content_type = head_resp.headers.get("content-type", "video/mp4")
-        accept_ranges = head_resp.headers.get("accept-ranges", "bytes")
     except Exception as e:
         await client.aclose()
         raise HTTPException(status_code=502, detail=f"Failed to reach video URL: {e}")
 
-    # Parse Range header if present
     start_byte = 0
     end_byte = content_length - 1 if content_length > 0 else 0
     is_partial = False
 
     if range_header and "bytes=" in range_header:
         is_partial = True
-        range_spec = range_header.split("bytes=")[1]
-        parts = range_spec.split("-")
+        parts = range_header.split("bytes=")[1].split("-")
         start_byte = int(parts[0]) if parts[0] else 0
         if len(parts) > 1 and parts[1]:
             end_byte = int(parts[1])
 
-    # Build upstream request headers — no auth, video URL is on Google Cloud Storage
     upstream_headers: dict = {}
     if is_partial:
         upstream_headers["Range"] = f"bytes={start_byte}-{end_byte}"
 
-    # Stream the video content
-    upstream_req = client.build_request(
-        "GET",
-        video_url,
-        headers=upstream_headers,
-    )
+    upstream_req = client.build_request("GET", video_url, headers=upstream_headers)
     upstream_resp = await client.send(upstream_req, stream=True)
 
     if upstream_resp.status_code not in (200, 206):
@@ -392,13 +412,11 @@ async def proxy_video_stream(task_id: str, range_header: str | None) -> Streamin
 
     actual_length = int(upstream_resp.headers.get("content-length", 0))
 
-    # Build response headers
     resp_headers = {
         "Content-Type": content_type,
         "Accept-Ranges": "bytes",
         "Cache-Control": "public, max-age=3600",
     }
-
     if is_partial:
         resp_headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{content_length}"
         resp_headers["Content-Length"] = str(actual_length)
@@ -415,36 +433,28 @@ async def proxy_video_stream(task_id: str, range_header: str | None) -> Streamin
             await upstream_resp.aclose()
             await client.aclose()
 
-    return StreamingResponse(
-        stream_generator(),
-        status_code=status_code,
-        headers=resp_headers,
-    )
+    return StreamingResponse(stream_generator(), status_code=status_code, headers=resp_headers)
 
 
-async def proxy_video_download(task_id: str) -> Response:
-    """Download video file as an attachment."""
-    status = await query_task_status(task_id)
+async def proxy_video_download(video_id: str) -> Response:
+    """Download the video file as an attachment."""
+    status = await query_task_status(video_id)
     if status.status != "completed" or not status.video_url:
         raise HTTPException(
             status_code=400,
             detail=f"Video not ready. Current status: {status.status}",
         )
 
-    async with _no_proxy_client(timeout=120) as client:
-        # NOTE: No auth headers — video URL is on Google Cloud Storage, not Agnes API.
+    async with _no_proxy_client(timeout=180) as client:
         resp = await client.get(status.video_url)
         if resp.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Failed to download video: {resp.status_code}",
-            )
+            raise HTTPException(status_code=502, detail=f"Failed to download video: {resp.status_code}")
 
         return Response(
             content=resp.content,
             media_type="video/mp4",
             headers={
-                "Content-Disposition": f'attachment; filename="video_{task_id}.mp4"',
+                "Content-Disposition": f'attachment; filename="video_{video_id}.mp4"',
                 "Content-Length": str(len(resp.content)),
             },
         )

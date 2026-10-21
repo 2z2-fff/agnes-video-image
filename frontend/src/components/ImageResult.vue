@@ -10,12 +10,16 @@ function formatTime(sec: number): string {
   return `${m}分${s}秒`;
 }
 
-// Map image size to CSS aspect-ratio
-const sizeAspectRatio: Record<string, string> = {
-  "1024x1024": "1 / 1",
-  "3840x2160": "16 / 9",
-  "2160x3840": "9 / 16",
-  "4096x4096": "1 / 1",
+// Aspect-ratio keyed by the requested ratio (tier no longer implies a shape).
+const ratioAspect: Record<string, string> = {
+  "1:1": "1 / 1",
+  "16:9": "16 / 9",
+  "9:16": "9 / 16",
+  "4:3": "4 / 3",
+  "3:4": "3 / 4",
+  "3:2": "3 / 2",
+  "2:3": "2 / 3",
+  "21:9": "21 / 9",
 };
 </script>
 
@@ -42,7 +46,7 @@ const sizeAspectRatio: Record<string, string> = {
   <div v-else-if="store.isComplete && store.resultImageUrl" class="result-area">
     <div
       class="image-wrapper"
-      :style="{ aspectRatio: sizeAspectRatio[store.size] || '1 / 1' }"
+      :style="{ aspectRatio: ratioAspect[store.ratio] || '1 / 1' }"
     >
       <img
         :src="store.resultImageUrl"

@@ -1,23 +1,26 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { useVideoStore } from "../stores/videoStore";
+import type { AspectRatio } from "../api/video";
 
 const store = useVideoStore();
 
-// Map aspect ratio to CSS aspect-ratio value
-const aspectRatioCss = {
+// Map every aspect ratio the video API accepts to a CSS aspect-ratio value.
+const aspectRatioCss: Record<AspectRatio, string> = {
+  "21:9": "21 / 9",
   "16:9": "16 / 9",
-  "9:16": "9 / 16",
-  "1:1": "1 / 1",
   "4:3": "4 / 3",
-} as const;
+  "1:1": "1 / 1",
+  "3:4": "3 / 4",
+  "9:16": "9 / 16",
+};
+
+const playerAspect = computed(() => aspectRatioCss[store.aspectRatio] ?? "16 / 9");
 </script>
 
 <template>
   <div class="video-result-area" v-if="store.isComplete && store.streamUrl">
-    <div
-      class="video-wrapper"
-      :style="{ aspectRatio: aspectRatioCss[store.aspectRatio] }"
-    >
+    <div class="video-wrapper" :style="{ aspectRatio: playerAspect }">
       <video
         :src="store.streamUrl"
         controls

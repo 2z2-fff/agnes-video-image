@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { useImageStore } from "../stores/imageStore";
-import type { ImageMode, ImageSize } from "../api/image";
+import { IMAGE_DIMENSIONS, type ImageMode, type ImageRatio, type ImageSize } from "../api/image";
 import PromptEngineer from "./PromptEngineer.vue";
 import { cartoonPresets } from "../data/promptPresets";
 
@@ -17,12 +17,13 @@ watch(() => store.mode, (newMode) => {
   }
 });
 
-const sizeOptions: { label: string; value: ImageSize }[] = [
-  { label: "标准 1:1", value: "1024x1024" },
-  { label: "4K 16:9", value: "3840x2160" },
-  { label: "4K 9:16", value: "2160x3840" },
-  { label: "4K 1:1", value: "4096x4096" },
-];
+// Tier + ratio, as documented for Agnes Image 2.5 Flash.
+// Exact pixel sizes (e.g. 3840x2160) are accepted but silently normalised,
+// so the UI only offers tiers.
+const sizeOptions: ImageSize[] = ["1K", "2K", "3K", "4K"];
+const ratioOptions: ImageRatio[] = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"];
+
+const outputDimensions = computed(() => IMAGE_DIMENSIONS[store.ratio][store.size]);
 
 const modeTabs: { label: string; value: ImageMode }[] = [
   { label: "文生图", value: "txt2img" },
@@ -149,20 +150,38 @@ function canGenerate(): boolean {
 
     <!-- Size Selection -->
     <div class="form-section">
-      <label class="form-label">输出尺寸</label>
+      <label class="form-label">
+        输出分辨率
+        <span class="char-count">{{ outputDimensions }}</span>
+      </label>
       <div class="size-group">
         <button
           v-for="opt in sizeOptions"
-          :key="opt.value"
-          :class="['size-btn', { active: store.size === opt.value }]"
-          @click="store.size = opt.value"
+          :key="opt"
+          :class="['size-btn', { active: store.size === opt }]"
+          @click="store.size = opt"
         >
-          <span class="size-label">{{ opt.label }}</span>
-          <span class="size-value">{{ opt.value }}</span>
+          <span class="size-label">{{ opt }}</span>
+          <span class="size-value">{{ IMAGE_DIMENSIONS[store.ratio][opt] }}</span>
         </button>
       </div>
-      <p v-if="store.size !== '1024x1024'" class="size-hint">
-        4K 尺寸有速率限制（每分钟 1 次），如遇限流将自动等待重试
+    </div>
+
+    <!-- Aspect Ratio -->
+    <div class="form-section">
+      <label class="form-label">画幅比例</label>
+      <div class="ratio-group">
+        <button
+          v-for="r in ratioOptions"
+          :key="r"
+          :class="['ratio-btn', { active: store.ratio === r }]"
+          @click="store.ratio = r"
+        >
+          {{ r }}
+        </button>
+      </div>
+      <p class="size-hint">
+        当前模型所有档位均免费；输出尺寸由分辨率档位与画幅比例共同决定
       </p>
     </div>
 
@@ -383,9 +402,35 @@ function canGenerate(): boolean {
   color: var(--text-dim);
 }
 
+/* Ratio buttons */
+.ratio-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ratio-btn {
+  flex: 1 1 auto;
+  min-width: 60px;
+  padding: 8px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  transition: all 0.2s;
+}
+
+.ratio-btn.active {
+  border-color: var(--primary);
+  background: var(--primary-bg);
+  color: var(--primary);
+}
+
 .size-hint {
   font-size: 11px;
-  color: var(--warning);
+  color: var(--text-dim);
   line-height: 1.4;
 }
 

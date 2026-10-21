@@ -3,6 +3,7 @@ import { ref, computed } from "vue";
 import {
   generateImage,
   type ImageMode,
+  type ImageRatio,
   type ImageSize,
   type ImageTaskStatus,
 } from "../api/image";
@@ -13,7 +14,8 @@ export const useImageStore = defineStore("image", () => {
   const prompt = ref("");
   const imagePreview = ref<string | null>(null); // data URL for <img> preview
   const imageBase64 = ref<string | null>(null); // full data URI for API
-  const size = ref<ImageSize>("1024x1024");
+  const size = ref<ImageSize>("1K");
+  const ratio = ref<ImageRatio>("1:1");
 
   // ─── Task state ───────────────────────────────
   const taskStatus = ref<ImageTaskStatus>("idle");
@@ -83,6 +85,7 @@ export const useImageStore = defineStore("image", () => {
         prompt: prompt.value,
         image: (mode.value === "img2img" || mode.value === "cartoon") ? imageBase64.value : null,
         size: size.value,
+        ratio: ratio.value,
       });
 
       taskStatus.value = "complete";
@@ -112,6 +115,7 @@ export const useImageStore = defineStore("image", () => {
     imagePreview,
     imageBase64,
     size,
+    ratio,
     // task state
     taskStatus,
     resultImageUrl,
