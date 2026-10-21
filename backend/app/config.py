@@ -49,7 +49,7 @@ def max_reference_images(model: str | None = None) -> int:
 
 # Polling: docs recommend every 1–2s until completed/failed.
 POLL_INTERVAL_SEC = 2
-POLL_TIMEOUT_SEC = 900
+POLL_TIMEOUT_SEC = 1800
 
 # ─── Image (Agnes Image 2.5 Flash) ────────────────────────────────
 IMAGE_CREATE_URL = f"{AGNES_BASE_URL}/v1/images/generations"
@@ -80,8 +80,10 @@ IMAGE_RATIO_LABELS: dict[str, str] = {
 
 # Retry / backoff behaviour.
 # The provider rejects requests with 503 "queue is full" while capacity is
-# exhausted; these waits are free (no task is created), so allow a generous budget.
-IMAGE_MAX_RETRIES = 8
+# exhausted; these waits are free (no task is created), so allow a generous
+# budget — but keep MAX_RETRIES * COOLDOWN well below the client's 600s timeout
+# so the API always answers before the browser gives up.
+IMAGE_MAX_RETRIES = 15
 IMAGE_RATE_LIMIT_COOLD = 20.0
 IMAGE_SERVICE_UNAVAIL_COOLD = 20.0
 IMAGE_NETWORK_RETRY_DELAYS = [10, 20, 30]

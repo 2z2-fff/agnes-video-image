@@ -179,7 +179,11 @@ async def _call_image_api(req: ImageGenerateRequest) -> dict:
                     continue
                 raise HTTPException(
                     status_code=503,
-                    detail=f"图片生成服务繁忙（队列已满），已重试 {max_retries} 次，请稍后重试",
+                    detail=(
+                        f"图片生成服务繁忙（队列已满），已重试 {max_retries} 次、"
+                        f"约 {int(max_retries * IMAGE_SERVICE_UNAVAIL_COOLD)} 秒仍未空闲。"
+                        "队列为全平台共享，建议稍后重试；本次未创建任务、也未计费。"
+                    ),
                 )
 
             if resp.status_code != 200:

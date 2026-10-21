@@ -35,11 +35,25 @@ export interface TaskResult {
 }
 
 export interface CreateTaskResult {
-  task_id: string;
+  task_id?: string;
+  job_id?: string;
   status: string;
-  model: string;
-  size: string;
-  seconds: number;
+  model?: string;
+  size?: string;
+  seconds?: number;
+  message?: string;
+}
+
+/** One queued job: either still being submitted, or an Agnes task in flight. */
+export interface JobResult {
+  job_id: string;
+  status: string;
+  task_id: string | null;
+  video_url: string | null;
+  local_url: string | null;
+  progress: number | null;
+  error: string | null;
+  prompt?: string | null;
 }
 
 /** Backend capability descriptor (GET /api/config). */
@@ -65,15 +79,45 @@ export interface AppConfig {
 
 // ─── API functions ────────────────────────────────
 
-/** Submit a video generation task. Returns the task ID.
- * Timeout is 330s: the backend retries a full video queue for up to
- * 20 × 15s = 300s, plus the request itself.
+/** Submit a video generation task.
+ *
+ * Returns fast: either `task_id` (accepted immediately) or `job_id`
+ * (queue full → backend retries in the background). A short timeout is
+ * intentional — a long-blocking submit is what produced
+ * "timeout of 330000ms exceeded" and orphaned paid tasks.
  */
 export async function generateVideo(req: GenerateRequest): Promise<CreateTaskResult> {
   const resp = await api.post<CreateTaskResult>("/generate", req, {
-    timeout: 330000,
+    timeout: 30000,
   });
   return resp.data;
+}
+
+/** Query a queued job (submitting or running). */
+export async function getJob(jobId: string): Promise<JobResult> {
+  const resp = await api.get<JobResult>(`/jobs/${jobId}`, { timeout: 60000 });
+  return resp.data;
+}
+
+/**
+ * Poll a job until it exposes an Agnes task id (submission accepted) or fails.
+ * The backend keeps retrying a full queue for ~30 minutes in the background, so
+ * this window matches that budget.
+ */
+export async function waitForJobTaskId(
+  jobId: string,
+  timeoutMs = 2100000,
+  onTick?: (job: JobResult) => void
+): Promise<JobResult | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const job = await getJob(jobId);
+    onTick?.(job);
+    if (job.task_id) return job;
+    if (job.status === "failed" || job.status === "timeout") return job;
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  return null;
 }
 
 /** Query task status once (returns immediately). */
@@ -83,7 +127,7 @@ export async function getTaskStatus(taskId: string): Promise<TaskResult> {
 }
 
 /** Long-poll: wait until task completes, fails, or times out. */
-export async function waitForTask(taskId: string, timeout = 900): Promise<TaskResult> {
+export async function waitForTask(taskId: string, timeout = 1800): Promise<TaskResult> {
   const resp = await api.get<TaskResult>(`/generate/${taskId}/wait`, {
     params: { timeout },
     timeout: (timeout + 30) * 1000,

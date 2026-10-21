@@ -94,6 +94,14 @@ def find_by_task(task_id: str) -> dict | None:
     return None
 
 
+def get_record(record_id: str) -> dict | None:
+    """Look up a record by its local id (used as the job id)."""
+    for rec in _load():
+        if rec.get("id") == record_id:
+            return rec
+    return None
+
+
 def list_records(limit: int = 50, kind: str | None = None) -> list[dict]:
     """Return the newest records, optionally filtered by kind."""
     records = _load()

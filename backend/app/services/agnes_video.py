@@ -42,8 +42,10 @@ logger = logging.getLogger(__name__)
 
 # Queue-full handling: the video service allows a single concurrent task and
 # answers new requests with HTTP 503 / code "video_queue_full". Observed waits
-# of up to ~7 minutes, so the retry budget is deliberately generous.
-QUEUE_RETRY_ATTEMPTS = 30
+# of up to ~7 minutes, and the queue can stay saturated for hours, so the
+# background retry budget is deliberately long — it no longer blocks any HTTP
+# request (the client polls /api/jobs/{id} instead).
+QUEUE_RETRY_ATTEMPTS = 120          # 120 × 15s = 30 minutes
 QUEUE_RETRY_DELAY_SEC = 15
 
 # Status-query transport retries (the API sometimes drops the connection
@@ -205,8 +207,20 @@ def _extract_error_message(resp: httpx.Response) -> tuple[str, str]:
 # ─── Task lifecycle ────────────────────────────────────────────────
 
 
-async def create_video_task(req: GenerateRequest) -> dict:
-    """Submit a video task. Returns task metadata including the polling ID."""
+async def create_video_task(
+    req: GenerateRequest,
+    max_attempts: int = QUEUE_RETRY_ATTEMPTS,
+    record_id: str | None = None,
+) -> dict:
+    """Submit a video task. Returns task metadata including the polling ID.
+
+    ``max_attempts=0`` performs a single non-blocking attempt: if the shared
+    queue is full it raises 503 immediately so the HTTP request can return and
+    the retrying can continue in the background (a 10-minute blocked request
+    always loses the race against a client timeout, orphaning the task).
+
+    ``record_id`` reuses an existing history record instead of creating one.
+    """
     _validate_model_and_size(req)
     body = _build_body(req)
 
@@ -217,7 +231,7 @@ async def create_video_task(req: GenerateRequest) -> dict:
     )
 
     async with _no_proxy_client(timeout=180) as client:
-        for attempt in range(QUEUE_RETRY_ATTEMPTS + 1):
+        for attempt in range(max_attempts + 1):
             resp = await client.post(CREATE_VIDEO_URL, headers=_get_headers(), json=body)
 
             if resp.status_code == 200:
@@ -228,8 +242,7 @@ async def create_video_task(req: GenerateRequest) -> dict:
                     video_id, data.get("status"), data.get("seconds"), data.get("size"),
                 )
                 # Persist immediately: an in-flight task must survive a page reload.
-                history.add_record(
-                    "video",
+                fields = dict(
                     task_id=video_id,
                     prompt=req.prompt,
                     mode=body["mode"],
@@ -239,7 +252,12 @@ async def create_video_task(req: GenerateRequest) -> dict:
                     seconds=req.seconds,
                     aspect_ratio=req.aspect_ratio,
                     status=data.get("status", "queued"),
+                    error=None,
                 )
+                if record_id:
+                    history.update_record(record_id=record_id, **fields)
+                else:
+                    history.add_record("video", **fields)
                 return {
                     "video_id": video_id,
                     "status": data.get("status", "queued"),
@@ -252,10 +270,10 @@ async def create_video_task(req: GenerateRequest) -> dict:
 
             # 503 / video_queue_full → the queue is busy; wait and retry.
             if resp.status_code == 503 or code == "video_queue_full":
-                if attempt < QUEUE_RETRY_ATTEMPTS:
+                if attempt < max_attempts:
                     logger.warning(
                         "Video queue full (attempt %d/%d), retry in %ds",
-                        attempt + 1, QUEUE_RETRY_ATTEMPTS, QUEUE_RETRY_DELAY_SEC,
+                        attempt + 1, max_attempts, QUEUE_RETRY_DELAY_SEC,
                     )
                     await asyncio.sleep(QUEUE_RETRY_DELAY_SEC)
                     continue
@@ -263,8 +281,8 @@ async def create_video_task(req: GenerateRequest) -> dict:
                     status_code=503,
                     detail=(
                         "Agnes 视频队列已满（同一时间仅允许 1 个任务），"
-                        f"已等待约 {QUEUE_RETRY_ATTEMPTS * QUEUE_RETRY_DELAY_SEC // 60} 分钟仍未空闲。"
-                        "请稍后重试，或等待其他任务完成。"
+                        f"已排队等待约 {QUEUE_RETRY_ATTEMPTS * QUEUE_RETRY_DELAY_SEC // 60} 分钟仍未空闲；"
+                        "本次未创建任务、未计费，请稍后重试"
                     ),
                 )
 
@@ -283,6 +301,33 @@ async def create_video_task(req: GenerateRequest) -> dict:
             )
 
     raise HTTPException(status_code=500, detail="Video task creation failed")
+
+
+# ─── Background submission (queue-full path) ──────────────────────
+
+# Keep strong references so the event loop does not garbage-collect the tasks.
+_submit_jobs: set[asyncio.Task] = set()
+
+
+async def _submit_worker(record_id: str, req: GenerateRequest) -> None:
+    """Retry submitting until accepted, then attach the Agnes task id."""
+    try:
+        await create_video_task(
+            req, max_attempts=QUEUE_RETRY_ATTEMPTS, record_id=record_id
+        )
+    except HTTPException as exc:
+        logger.warning("Background submit failed (record %s): %s", record_id, exc.detail)
+        history.update_record(record_id=record_id, status="failed", error=str(exc.detail))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Background submit crashed (record %s)", record_id)
+        history.update_record(record_id=record_id, status="failed", error=str(exc))
+
+
+def spawn_submit(record_id: str, req: GenerateRequest) -> None:
+    """Start a background submit retry loop for a queued generation."""
+    task = asyncio.create_task(_submit_worker(record_id, req))
+    _submit_jobs.add(task)
+    task.add_done_callback(_submit_jobs.discard)
 
 
 async def _persist_video_file(video_id: str, remote_url: str) -> str | None:

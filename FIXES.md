@@ -374,7 +374,6 @@ PASS  多图参考(2张): task_4yNjwlciXIna1Ql0A67wW1AHRdpD9gRz.mp4
 ---
 
 ## 八、修复：切换页面丢失已生成/生成中的资源（v2.2.0）
-
 ### 8.1 现象
 
 生成图片或视频后切换页面，结果消失；生成中的任务也随之丢失；并且**没有任何保存**。
@@ -448,3 +447,81 @@ vue-tsc --noEmit 通过
 | 历史记录无分页 | 最多保留 200 条，超出按时间淘汰；量大后需要分页或迁移到数据库 |
 | 删除记录不删文件 | `DELETE /api/history/{id}` 只移除索引，`uploads/` 里的文件保留，需要时另做清理 |
 | 视频落盘占磁盘 | 每条视频约 0.3–3 MB，长期运行需定期清理 `uploads/videos` |
+
+---
+
+## 九、修复：两个错误提示的根因（v2.3.0）
+
+### 9.1 错误一：`图片生成服务繁忙（队列已满），已重试 8 次，请稍后重试`
+
+**来源**：`app/services/agnes_image.py` 的 503 分支。纯服务端容量问题，非代码缺陷。
+
+当时的预算是 `IMAGE_MAX_RETRIES=8 × IMAGE_SERVICE_UNAVAIL_COOLD=20s = 160s`。
+实测图片队列被占满可持续 10 分钟以上（早前图生图测试耗了 4 轮才成功），160 秒的耐心明显不够。
+
+**修复**：
+
+| 项 | 改前 | 改后 |
+| --- | --- | --- |
+| 重试次数 | 8 | **15** |
+| 最长等待 | 160s | **300s** |
+| 客户端超时 | 600s | 600s（不变） |
+
+关键约束：`15 × 20s = 300s < 600s` 客户端超时，**服务端永远先返回**，不会再出现"浏览器先放弃"。
+提示文案也补上了已等待时长和"本次未创建任务、未计费"，避免用户误以为被扣费。
+
+### 9.2 错误二：`生成失败 timeout of 330000ms exceeded`（真 Bug）
+
+这条是 **axios 客户端超时**（`timeout of Xms exceeded` 是 axios 的固定文案），330000ms 正是前端为视频创建设的超时。
+
+**根因是超时预算错配**：
+
+```text
+客户端 POST /api/generate 超时：330s
+服务端队列重试预算：30 × 15s = 450s   ← 比客户端还长
+```
+
+后果比"报错"严重得多：
+
+1. 客户端在 330s 放弃并显示"生成失败"；
+2. 服务端仍在重试，到第 450s 前**可能真的把任务创建成功**；
+3. 但 task_id 只返回给了一个已经断开的请求 → **任务成了孤儿**：用户在界面上看不到，任务却可能已在队列里运行甚至计费。
+
+**修复：把"阻塞式排队"改成"后台排队 + job 轮询"**
+
+```text
+POST /api/generate
+  ├─ 先尝试一次（不做长重试）
+  ├─ 200 → {task_id}          队列有空，立即建单（老客户端兼容）
+  └─ 202 → {job_id, submitting} 队列满：后台继续重试，立刻返回
+GET /api/jobs/{job_id}  → submitting / queued / in_progress / completed / failed
+```
+
+| 层 | 改动 |
+| --- | --- |
+| `services/agnes_video.py` | `create_video_task(req, max_attempts, record_id)`；新增 `spawn_submit()` 后台重试（强引用集合防 GC）、复用历史记录而非重复建 |
+| `api/video.py` | POST 改单次尝试；503 时写记录 + 起后台任务 + 返回 202；新增 `GET /api/jobs/{job_id}`（独立 `/api/jobs` 前缀，避免与 `/{task_id}` 路由冲突） |
+| `schemas.py` | 新增 `JobResponse` |
+| `frontend/api/video.ts` | `generateVideo` 超时 **330s → 30s**；新增 `getJob()`、`waitForJobTaskId()` |
+| `frontend/stores/videoStore.ts` | 兼容 200/202 两种返回；持久化 `jobId`，刷新后按 job 续查；`jobId` 一并清理 |
+| `scripts/e2e_*.py` | 适配 202：轮询 job 拿到 task_id，避免每轮重试都新建任务 |
+
+### 9.3 验证
+
+```text
+# 队列满时 POST 立刻返回，不再阻塞
+POST /api/generate → HTTP 202, time=2.727s
+{"job_id":"4b21eefa7b8a","status":"submitting","task_id":null}
+
+# job 可追踪，且写入了历史
+GET /api/jobs/4b21eefa7b8a → status=submitting
+GET /api/history?kind=video  → id=4b21eefa7b8a status=submitting
+```
+
+对比修复前：同样的请求会阻塞 **330s 后被浏览器掐断，且不返回任何 task_id**。
+
+### 9.4 为什么不选"继续加长客户端超时"
+
+因为浏览器/网关/代理的超时是叠加的（浏览器、Vite 代理、未来可能的 nginx），任何一环掐断都会复现孤儿任务。
+**把等待从 HTTP 请求里挪出去**，才是这一类问题的根治方式；后续即使排队 30 分钟也不会丢任务。
+

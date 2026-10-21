@@ -69,17 +69,48 @@ def wait_task(task_id, label, timeout=2400):
     return {"status": "timeout"}
 
 
+def resolve_job(job_id, label, timeout=1200):
+    """A 202 means the backend retries a full queue in the background."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            r = C.get(f"{BASE}/api/jobs/{job_id}", timeout=60)
+            if r.status_code == 200:
+                j = r.json()
+                print(f"    [{label}] job {j.get('status')} task_id={j.get('task_id')}")
+                if j.get("task_id"):
+                    return {"task_id": j["task_id"]}
+                if j.get("status") in ("failed", "timeout"):
+                    return {"__fatal__": j.get("error") or j.get("status")}
+        except httpx.TransportError as e:
+            print(f"    [{label}] job poll transport {type(e).__name__}")
+        time.sleep(5)
+    return {"__fatal__": "job never produced a task id"}
+
+
 def create_and_wait(label, payload, max_create_wait=2400):
     start = time.time()
     attempt = 0
     while time.time() - start < max_create_wait:
         attempt += 1
         try:
-            r = C.post(f"{BASE}/api/generate", json=payload, timeout=900)
+            r = C.post(f"{BASE}/api/generate", json=payload, timeout=120)
         except httpx.TransportError as e:
             print(f"    [{label}] transport {type(e).__name__} on create")
             time.sleep(10)
             continue
+        if r.status_code == 202:
+            d = r.json()
+            print(f"    [{label}] queued as job {d.get('job_id')}, waiting...")
+            d = resolve_job(d["job_id"], label)
+            if not d or "__fatal__" in d:
+                results.append((label, False, str(d)[:160]))
+                return
+            final = wait_task(d["task_id"], label)
+            ok = final.get("status") == "completed" and bool(final.get("video_url"))
+            results.append((label, ok, f"url={final.get('video_url')}"))
+            print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {final.get('status')}")
+            return
         if r.status_code == 200:
             d = r.json()
             print(f"    [{label}] created after {attempt} attempt(s): {d['task_id']}")
@@ -88,6 +119,13 @@ def create_and_wait(label, payload, max_create_wait=2400):
             results.append((label, ok, f"url={final.get('video_url')}"))
             print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {final.get('status')} {final.get('video_url')}")
             return
+        print(f"    [{label}] attempt {attempt}: HTTP {r.status_code} {r.text[:130]}")
+        if r.status_code in (400, 422):
+            results.append((label, False, f"HTTP {r.status_code} {r.text[:160]}"))
+            return
+        time.sleep(20)
+    results.append((label, False, "queue never freed"))
+    print(f"  [FAIL] {label}: queue never freed")
         print(f"    [{label}] attempt {attempt}: HTTP {r.status_code} {r.text[:130]}")
         if r.status_code in (400, 422):
             results.append((label, False, f"HTTP {r.status_code} {r.text[:160]}"))

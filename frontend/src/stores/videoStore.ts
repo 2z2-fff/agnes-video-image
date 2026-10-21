@@ -6,6 +6,7 @@ import {
   getDownloadUrl,
   getAppConfig,
   waitForTask,
+  waitForJobTaskId,
   type AspectRatio,
   type GenerateMode,
   type TaskStatus,
@@ -18,6 +19,7 @@ const STORAGE_KEY = "video.last";
 /** Shape persisted in localStorage so a reload keeps the last result. */
 interface PersistedVideo {
   taskId: string | null;
+  jobId: string | null;
   status: TaskStatus;
   videoUrl: string | null;
   localUrl: string | null;
@@ -76,6 +78,7 @@ export const useVideoStore = defineStore("video", () => {
   // ─── Task state ───────────────────────────────
   const taskStatus = ref<TaskStatus>("idle");
   const taskId = ref<string | null>(null);
+  const jobId = ref<string | null>(null); // local job id while the queue is full
   const videoUrl = ref<string | null>(null);
   const localUrl = ref<string | null>(null); // /uploads/videos/... copy served by the backend
   const error = ref<string | null>(null);
@@ -244,23 +247,41 @@ export const useVideoStore = defineStore("video", () => {
         seed: seed.value,
       });
 
-      taskId.value = created.task_id;
+      // Two shapes: accepted immediately (task_id) or queued because the shared
+      // queue is full (job_id → backend retries in the background).
+      let agnesTaskId = created.task_id ?? null;
+
+      if (!agnesTaskId && created.job_id) {
+        jobId.value = created.job_id;
+        taskStatus.value = "queued";
+        persist();
+
+        const job = await waitForJobTaskId(created.job_id, 900000, (tick) => {
+          if (tick.progress != null) progress.value = tick.progress;
+          taskStatus.value = tick.task_id ? "in_progress" : "queued";
+        });
+
+        if (!job?.task_id) {
+          taskStatus.value = job?.status === "timeout" ? "timeout" : "failed";
+          error.value = job?.error || "排队超时，任务未能提交（未创建任务、未计费）";
+          return;
+        }
+        agnesTaskId = job.task_id;
+        progress.value = job.progress ?? 0;
+      }
+
+      if (!agnesTaskId) {
+        taskStatus.value = "failed";
+        error.value = "服务端未返回任务 ID";
+        return;
+      }
+
+      taskId.value = agnesTaskId;
       taskStatus.value = "in_progress";
       // Persist the id immediately: a reload must not orphan a queued task.
       persist();
 
-      const result = await waitForTask(created.task_id, 900);
-
-      if (result.status === "completed") {
-        taskStatus.value = "completed";
-        progress.value = 100;
-        localUrl.value = result.local_url ?? null;
-        // Prefer the backend's local copy: it outlives Agnes' temporary URL.
-        videoUrl.value = result.local_url || getStreamUrl(created.task_id);
-      } else if (result.status === "failed" || result.status === "timeout") {
-        taskStatus.value = result.status;
-        error.value = result.error || "生成失败，请重试";
-      }
+      await awaitTaskFinish(agnesTaskId);
     } catch (e) {
       taskStatus.value = "failed";
       error.value = e instanceof Error ? e.message : "未知错误";
@@ -270,16 +291,32 @@ export const useVideoStore = defineStore("video", () => {
     }
   }
 
+  /** Wait for an Agnes task to finish and apply the result to the store. */
+  async function awaitTaskFinish(id: string) {
+    const result = await waitForTask(id, 1800);
+    if (result.status === "completed") {
+      taskStatus.value = "completed";
+      progress.value = 100;
+      localUrl.value = result.local_url ?? null;
+      // Prefer the backend's local copy: it outlives Agnes' temporary URL.
+      videoUrl.value = result.local_url || getStreamUrl(id);
+    } else if (result.status === "failed" || result.status === "timeout") {
+      taskStatus.value = result.status;
+      error.value = result.error || "生成失败，请重试";
+    }
+  }
+
   // ─── Persistence / resume ─────────────────────
 
   /** Write the current task state to localStorage. */
   function persist() {
-    if (!taskId.value && taskStatus.value === "idle") {
+    if (!taskId.value && !jobId.value && taskStatus.value === "idle") {
       removeKey(STORAGE_KEY);
       return;
     }
     saveJSON(STORAGE_KEY, {
       taskId: taskId.value,
+      jobId: jobId.value,
       status: taskStatus.value,
       videoUrl: videoUrl.value,
       localUrl: localUrl.value,
@@ -297,9 +334,11 @@ export const useVideoStore = defineStore("video", () => {
   /** Restore the last result (or resume polling an unfinished task) on startup. */
   async function restore() {
     const saved = loadJSON<PersistedVideo>(STORAGE_KEY);
-    if (!saved || !saved.taskId) return;
+    if (!saved) return;
+    if (!saved.taskId && !saved.jobId) return;
 
-    taskId.value = saved.taskId;
+    taskId.value = saved.taskId ?? null;
+    jobId.value = saved.jobId ?? null;
     prompt.value = saved.prompt ?? prompt.value;
     mode.value = saved.mode ?? mode.value;
     aspectRatio.value = saved.aspectRatio ?? aspectRatio.value;
@@ -320,9 +359,36 @@ export const useVideoStore = defineStore("video", () => {
       return;
     }
 
-    // Still queued/running when the page was closed → keep polling.
     taskStatus.value = saved.status === "queued" ? "queued" : "in_progress";
-    resumePolling(saved.taskId);
+
+    // Submission was still queued → resume the job, then continue with the task.
+    if (!saved.taskId && saved.jobId) {
+      resumeJob(saved.jobId);
+      return;
+    }
+    if (saved.taskId) resumePolling(saved.taskId);
+  }
+
+  /** Re-attach to a job that was still waiting for queue capacity. */
+  async function resumeJob(id: string) {
+    try {
+      const job = await waitForJobTaskId(id, 900000, (tick) => {
+        if (tick.progress != null) progress.value = tick.progress;
+        taskStatus.value = tick.task_id ? "in_progress" : "queued";
+      });
+      if (!job?.task_id) {
+        taskStatus.value = job?.status === "timeout" ? "timeout" : "failed";
+        error.value = job?.error || "排队超时，任务未能提交";
+        return;
+      }
+      taskId.value = job.task_id;
+      taskStatus.value = "in_progress";
+      persist();
+      await resumePolling(job.task_id);
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : "恢复排队任务失败";
+      persist();
+    }
   }
 
   /** Re-attach to a task that was running when the page was closed. */
@@ -332,7 +398,7 @@ export const useVideoStore = defineStore("video", () => {
       elapsedSec.value = Math.floor((Date.now() - startTime) / 1000);
     }, 1000);
     try {
-      const result = await waitForTask(id, 900);
+      const result = await waitForTask(id, 1800);
       if (result.status === "completed") {
         taskStatus.value = "completed";
         progress.value = 100;
@@ -370,6 +436,7 @@ export const useVideoStore = defineStore("video", () => {
   function reset() {
     taskStatus.value = "idle";
     taskId.value = null;
+    jobId.value = null;
     videoUrl.value = null;
     localUrl.value = null;
     error.value = null;
@@ -403,6 +470,7 @@ export const useVideoStore = defineStore("video", () => {
     // task state
     taskStatus,
     taskId,
+    jobId,
     videoUrl,
     localUrl,
     error,

@@ -121,13 +121,29 @@ class TaskResponse(BaseModel):
 
 
 class CreateTaskResponse(BaseModel):
-    """Response for POST /api/generate."""
+    """Response for POST /api/generate (submitted synchronously)."""
 
     task_id: str
     status: str = "queued"
     model: str = ""
     size: str = ""
     seconds: int = 0
+
+
+class JobResponse(BaseModel):
+    """Response for POST /api/generate (queued) and GET /api/jobs/{job_id}."""
+
+    job_id: str
+    status: str = Field(
+        ...,
+        description="submitting | queued | pending | in_progress | completed | failed | timeout",
+    )
+    task_id: str | None = Field(None, description="Agnes task id, available once submitted")
+    video_url: str | None = None
+    local_url: str | None = None
+    progress: int | None = None
+    error: str | None = None
+    prompt: str | None = None
 
 
 # ─── Image generation models ───────────────────────────────────────

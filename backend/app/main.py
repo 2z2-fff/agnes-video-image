@@ -22,7 +22,7 @@ from app.config import (
     VIDEO_SIZES,
     max_reference_images,
 )
-from app.api.video import router as video_router
+from app.api.video import router as video_router, jobs_router
 from app.api.image import router as image_router
 from app.api.history import router as history_router
 
@@ -50,6 +50,7 @@ app.add_middleware(
 
 # Register routes
 app.include_router(video_router)
+app.include_router(jobs_router)
 app.include_router(image_router)
 app.include_router(history_router)
 

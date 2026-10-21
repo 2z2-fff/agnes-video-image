@@ -63,14 +63,34 @@ def wait_task(task_id, label, timeout=1800):
     return {"status": "timeout", "error": "client-side timeout"}
 
 
+def resolve_job(job_id, label, timeout=1200):
+    """A 202 means the backend is retrying a full queue in the background."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            r = C.get(f"{BASE}/api/jobs/{job_id}", timeout=60)
+            if r.status_code == 200:
+                j = r.json()
+                st = j.get("status")
+                print(f"    [{label}] job {st} task_id={j.get('task_id')}")
+                if j.get("task_id"):
+                    return {"task_id": j["task_id"]}
+                if st in ("failed", "timeout"):
+                    return {"__fatal__": j.get("error") or st}
+        except httpx.TransportError as e:
+            print(f"    [{label}] job poll transport {type(e).__name__}")
+        time.sleep(5)
+    return {"__fatal__": "job never produced a task id"}
+
+
 def create_video(payload, label, max_wait=1800):
-    """POST /api/generate, tolerating 503 queue-full from the provider."""
+    """POST /api/generate, tolerating queue-full (202 job) and transient errors."""
     start = time.time()
     attempt = 0
     while time.time() - start < max_wait:
         attempt += 1
         try:
-            r = C.post(f"{BASE}/api/generate", json=payload, timeout=900)
+            r = C.post(f"{BASE}/api/generate", json=payload, timeout=120)
         except httpx.TransportError as e:
             print(f"    [{label}] transport {type(e).__name__} on create")
             time.sleep(10)
@@ -79,6 +99,10 @@ def create_video(payload, label, max_wait=1800):
             d = r.json()
             print(f"    [{label}] created after {attempt} attempt(s): {d}")
             return d
+        if r.status_code == 202:
+            d = r.json()
+            print(f"    [{label}] queued as job {d.get('job_id')} (queue full), waiting...")
+            return resolve_job(d["job_id"], label)
         print(f"    [{label}] attempt {attempt}: HTTP {r.status_code} {r.text[:200]}")
         if r.status_code in (400, 422):
             return {"__fatal__": r.text}
