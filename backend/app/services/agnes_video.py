@@ -30,6 +30,8 @@ from app.config import (
     POLL_INTERVAL_SEC,
     POLL_TIMEOUT_SEC,
     QUERY_VIDEO_URL,
+    REF_IMAGE_MAX_SIDE,
+    REF_TOTAL_MAX_MB,
     VIDEO_DIR,
     VIDEO_MODEL,
     max_reference_images,
@@ -123,18 +125,17 @@ def _validate_model_and_size(req: GenerateRequest) -> None:
             )
 
 
-def _first_frame_value(image: str) -> str:
-    """Normalise the uploaded image into the `first_frame` value.
+async def _encode_image(image: str) -> str:
+    """Encode one uploaded image to a downscaled PNG data URI.
 
-    The image is re-encoded to PNG (the API is picky about format) and passed
-    as a data URI, so no public hosting is required for image-to-video.
+    Runs in a worker thread: PIL decode/encode on a large photo takes seconds,
+    and doing that on the event loop would stall status polling for every other
+    request in flight.
     """
-    png_uri = _ensure_png_data_uri(image)
-    logger.info("keyframe first_frame: png data URI, length=%d", len(png_uri))
-    return png_uri
+    return await asyncio.to_thread(_ensure_png_data_uri, image, REF_IMAGE_MAX_SIDE)
 
 
-def _build_body(req: GenerateRequest) -> dict:
+async def _build_body(req: GenerateRequest) -> dict:
     """Build the create-task body for Video 2.5.
 
     Media routing (mutually exclusive, enforced by the schema):
@@ -154,17 +155,21 @@ def _build_body(req: GenerateRequest) -> dict:
     if req.mode == req.mode.img2vid:
         if not req.image:
             raise HTTPException(status_code=400, detail="img2vid 模式需要上传一张参考图片")
-        body["first_frame"] = _first_frame_value(req.image)
+        body["first_frame"] = await _encode_image(req.image)
         if req.last_image:
             # first + last frame pair turns the task into a controlled transition
-            body["last_frame"] = _first_frame_value(req.last_image)
+            body["last_frame"] = await _encode_image(req.last_image)
 
     elif req.mode == req.mode.reference:
         refs = [i for i in (req.images or []) if i]
         if not refs:
             raise HTTPException(status_code=400, detail="多图参考模式至少需要上传 1 张图片")
-        body["images"] = [_first_frame_value(i) for i in refs]
-        logger.info("reference mode: %d image(s) attached", len(refs))
+        encoded = [await _encode_image(i) for i in refs]
+        body["images"] = encoded
+        logger.info(
+            "reference mode: %d image(s), total payload=%.1f MB",
+            len(encoded), sum(len(e) for e in encoded) / 1024 / 1024,
+        )
 
         if "<Picture" not in req.prompt:
             logger.warning(
@@ -174,6 +179,20 @@ def _build_body(req: GenerateRequest) -> dict:
 
     if req.seed is not None:
         body["seed"] = req.seed
+
+    # The API caps a request at 50MB; fail fast with guidance instead of letting
+    # the provider reject (or the upload time out) on a huge payload.
+    total_bytes = sum(len(v) for v in (body.get("images") or []))
+    total_bytes += len(body.get("first_frame") or "") + len(body.get("last_frame") or "")
+    if total_bytes > REF_TOTAL_MAX_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"参考图片总体积过大（约 {total_bytes // 1024 // 1024} MB，上限 {REF_TOTAL_MAX_MB} MB）。"
+                "请减少图片数量或改用更小的图片（服务端已自动压缩到 "
+                f"{REF_IMAGE_MAX_SIDE}px 长边，仍超限时可先自行缩小）。"
+            ),
+        )
 
     return body
 
@@ -222,7 +241,7 @@ async def create_video_task(
     ``record_id`` reuses an existing history record instead of creating one.
     """
     _validate_model_and_size(req)
-    body = _build_body(req)
+    body = await _build_body(req)
 
     logger.info(
         "Create video: model=%s mode=%s size=%s %ss %s, keys=%s, prompt=%s...",

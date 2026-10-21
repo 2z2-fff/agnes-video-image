@@ -56,12 +56,16 @@ def _get_headers() -> dict:
     }
 
 
-def _ensure_png_data_uri(image_data: str) -> str:
+def _ensure_png_data_uri(image_data: str, max_side: int | None = None) -> str:
     """Convert any image format to a PNG data URI.
 
     The image API only reliably honours image-to-image when the payload is a
     PNG data URI. A mismatched MIME type makes the service silently fall back
     to text-to-image, which shows up as "the result looks nothing like my input".
+
+    ``max_side`` downscales first. Lossless PNG inflates a phone photo ~4x
+    (8.9MB JPEG -> 38.7MB), so video reference frames must be shrunk before
+    encoding or the submit request cannot finish in time.
     """
     from PIL import Image
 
@@ -81,10 +85,13 @@ def _ensure_png_data_uri(image_data: str) -> str:
         original_size = img.size
         original_mode = img.mode
 
-        logger.info(
-            "PNG conversion: original format=%s, mode=%s, size=%s, mime=%s, bytes=%d",
-            original_format, original_mode, original_size, original_mime, len(img_bytes),
-        )
+        # Downscale before converting: cheaper and avoids multi-MB payloads.
+        if max_side and max(img.size) > max_side:
+            img.thumbnail((max_side, max_side), Image.LANCZOS)
+            logger.info(
+                "Downscaled reference image %s -> %s (max_side=%d)",
+                original_size, img.size, max_side,
+            )
 
         if img.mode in ("RGBA", "LA"):
             pass  # preserve transparency
@@ -99,8 +106,9 @@ def _ensure_png_data_uri(image_data: str) -> str:
         png_b64 = base64.b64encode(png_bytes).decode("ascii")
 
         logger.info(
-            "PNG conversion OK: %s/%s -> PNG, output bytes=%d",
-            original_format, original_mode, len(png_bytes),
+            "PNG conversion OK: %s/%s %s -> PNG %s, input=%dKB output=%dKB",
+            original_format, original_mode, original_size, img.size,
+            len(img_bytes) // 1024, len(png_bytes) // 1024,
         )
         return f"data:image/png;base64,{png_b64}"
     except Exception as e:

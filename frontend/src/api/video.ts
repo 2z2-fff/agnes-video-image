@@ -82,13 +82,13 @@ export interface AppConfig {
 /** Submit a video generation task.
  *
  * Returns fast: either `task_id` (accepted immediately) or `job_id`
- * (queue full → backend retries in the background). A short timeout is
- * intentional — a long-blocking submit is what produced
- * "timeout of 330000ms exceeded" and orphaned paid tasks.
+ * (slow/full queue → backend retries in the background). The server caps its
+ * fast attempt at 20s, so 45s here leaves plenty of margin for a large
+ * multi-image payload to reach the backend.
  */
 export async function generateVideo(req: GenerateRequest): Promise<CreateTaskResult> {
   const resp = await api.post<CreateTaskResult>("/generate", req, {
-    timeout: 30000,
+    timeout: 45000,
   });
   return resp.data;
 }

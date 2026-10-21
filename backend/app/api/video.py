@@ -1,12 +1,13 @@
 """REST API endpoints for video generation."""
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app import history
-from app.config import POLL_TIMEOUT_SEC
+from app.config import FAST_SUBMIT_TIMEOUT_SEC, POLL_TIMEOUT_SEC
 from app.schemas import CreateTaskResponse, GenerateRequest, JobResponse, TaskResponse
 from app.services import agnes_video
 
@@ -33,8 +34,15 @@ async def create_task(req: GenerateRequest):
     if req.mode == req.mode.img2vid and not req.image:
         raise HTTPException(status_code=400, detail="img2vid 模式需要上传一张参考图片")
 
+    reason = "queue_full"
     try:
-        info = await agnes_video.create_video_task(req, max_attempts=0)
+        # Hard cap on the fast path: if submitting takes longer than this, fall
+        # through to the background job instead of making the browser wait (and
+        # eventually abort at its own timeout).
+        info = await asyncio.wait_for(
+            agnes_video.create_video_task(req, max_attempts=0),
+            timeout=FAST_SUBMIT_TIMEOUT_SEC,
+        )
         return CreateTaskResponse(
             task_id=info["video_id"],
             status=info["status"],
@@ -42,11 +50,18 @@ async def create_task(req: GenerateRequest):
             size=info["size"],
             seconds=info["seconds"],
         )
+    except asyncio.TimeoutError:
+        reason = "slow_submit"
+        logger.info(
+            "Fast submit exceeded %.0fs; handing off to the background job",
+            FAST_SUBMIT_TIMEOUT_SEC,
+        )
     except HTTPException as exc:
         if exc.status_code != 503:
             raise
 
-    # Queue is full → hand off to the background and return a job id right away.
+    # Either the queue is full or the submit was too slow → hand off to the
+    # background and return a job id right away.
     record = history.add_record(
         "video",
         status="submitting",
@@ -58,7 +73,12 @@ async def create_task(req: GenerateRequest):
         ui_mode=req.mode.value,
     )
     agnes_video.spawn_submit(record["id"], req)
-    logger.info("Queue full: queued as job %s, retrying in background", record["id"])
+    message = (
+        f"提交耗时超过 {FAST_SUBMIT_TIMEOUT_SEC:.0f} 秒（参考图较大或网络较慢），已转后台继续提交"
+        if reason == "slow_submit"
+        else "视频队列已满，已在后台排队重试"
+    )
+    logger.info("Handed off as job %s (reason=%s)", record["id"], reason)
     return JSONResponse(
         status_code=202,
         content={
@@ -66,7 +86,8 @@ async def create_task(req: GenerateRequest):
             "status": "submitting",
             "task_id": None,
             "prompt": req.prompt,
-            "message": "视频队列已满，已在后台排队重试；可用 job_id 查询进度",
+            "reason": reason,
+            "message": f"{message}；可用 job_id 查询进度",
         },
     )
 

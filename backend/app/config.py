@@ -41,6 +41,17 @@ VIDEO_MAX_AUDIOS = 3
 VIDEO_MAX_VIDEOS = 1
 VIDEO_MAX_REFERENCE_FILES = 12
 
+# Reference images are re-encoded to lossless PNG and base64'd for the API,
+# which inflates phone photos by ~4x (8.9MB JPEG -> 38.7MB). Output video is
+# 720P at best here, so downsizing first costs nothing visually and keeps the
+# submit request small enough to finish inside the client timeout.
+REF_IMAGE_MAX_SIDE = int(os.getenv("REF_IMAGE_MAX_SIDE", "1536"))
+REF_TOTAL_MAX_MB = int(os.getenv("REF_TOTAL_MAX_MB", "45"))  # API limit is 50MB/request
+
+# The fast-path submit attempt must answer well inside the browser's POST
+# timeout; anything slower is handed to the background job instead.
+FAST_SUBMIT_TIMEOUT_SEC = float(os.getenv("FAST_SUBMIT_TIMEOUT_SEC", "20"))
+
 
 def max_reference_images(model: str | None = None) -> int:
     """How many `images` the given model accepts in `reference` mode."""
