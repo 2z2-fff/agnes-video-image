@@ -24,6 +24,7 @@ from app.config import (
 )
 from app.api.video import router as video_router
 from app.api.image import router as image_router
+from app.api.history import router as history_router
 
 # Configure logging
 logging.basicConfig(
@@ -50,6 +51,7 @@ app.add_middleware(
 # Register routes
 app.include_router(video_router)
 app.include_router(image_router)
+app.include_router(history_router)
 
 # Serve uploaded images as static files
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")

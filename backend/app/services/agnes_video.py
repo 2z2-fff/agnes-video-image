@@ -30,9 +30,11 @@ from app.config import (
     POLL_INTERVAL_SEC,
     POLL_TIMEOUT_SEC,
     QUERY_VIDEO_URL,
+    VIDEO_DIR,
     VIDEO_MODEL,
     max_reference_images,
 )
+from app import history
 from app.schemas import GenerateRequest, TaskResponse
 from app.services.agnes_image import _ensure_png_data_uri
 
@@ -225,6 +227,19 @@ async def create_video_task(req: GenerateRequest) -> dict:
                     "Task created: video_id=%s status=%s seconds=%s size=%s",
                     video_id, data.get("status"), data.get("seconds"), data.get("size"),
                 )
+                # Persist immediately: an in-flight task must survive a page reload.
+                history.add_record(
+                    "video",
+                    task_id=video_id,
+                    prompt=req.prompt,
+                    mode=body["mode"],
+                    ui_mode=req.mode.value,
+                    model=VIDEO_MODEL,
+                    size=str(data.get("size") or req.size),
+                    seconds=req.seconds,
+                    aspect_ratio=req.aspect_ratio,
+                    status=data.get("status", "queued"),
+                )
                 return {
                     "video_id": video_id,
                     "status": data.get("status", "queued"),
@@ -268,6 +283,32 @@ async def create_video_task(req: GenerateRequest) -> dict:
             )
 
     raise HTTPException(status_code=500, detail="Video task creation failed")
+
+
+async def _persist_video_file(video_id: str, remote_url: str) -> str | None:
+    """Download a finished video into ``uploads/videos`` and return its local URL.
+
+    Idempotent: an existing non-empty file is reused, so repeated polling is cheap.
+    Without this, the only copy of a result lives on Agnes' storage and is lost
+    as soon as the UI forgets the task id.
+    """
+    target = VIDEO_DIR / f"{video_id}.mp4"
+    if target.exists() and target.stat().st_size > 0:
+        return f"/uploads/videos/{target.name}"
+
+    try:
+        async with _no_proxy_client(timeout=300) as client:
+            # No Agnes auth header: storage hosts reject the API bearer token.
+            resp = await client.get(remote_url)
+        if resp.status_code != 200:
+            logger.warning("Persist video failed: HTTP %s", resp.status_code)
+            return None
+        target.write_bytes(resp.content)
+        logger.info("Video persisted: %s (%d bytes)", target, len(resp.content))
+        return f"/uploads/videos/{target.name}"
+    except Exception as e:
+        logger.warning("Persist video error: %s", e)
+        return None
 
 
 async def query_task_status(video_id: str) -> TaskResponse:
@@ -337,10 +378,39 @@ async def query_task_status(video_id: str) -> TaskResponse:
     if isinstance(error, dict):
         error = error.get("message") or str(error)
 
+    # Persist the finished file + keep the history record in sync, so the result
+    # survives page reloads and Agnes' link expiry.
+    local_url = None
+    if status == "completed" and video_url:
+        local_url = await _persist_video_file(video_id, video_url)
+
+    updated = history.update_record(
+        task_id=video_id,
+        status=status,
+        remote_url=video_url,
+        local_url=local_url,
+        error=error,
+        progress=data.get("progress"),
+    )
+    # Self-healing: a task created before history existed (or whose record was
+    # lost) still shows up once it reaches a terminal state.
+    if updated is None and status in ("completed", "failed"):
+        history.add_record(
+            "video",
+            task_id=video_id,
+            prompt=None,
+            model=VIDEO_MODEL,
+            status=status,
+            local_url=local_url,
+            remote_url=video_url,
+            error=error,
+        )
+
     return TaskResponse(
         task_id=video_id,
         status=status,
         video_url=video_url,
+        local_url=local_url,
         duration=duration,
         progress=data.get("progress"),
         error=error,

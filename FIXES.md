@@ -370,3 +370,81 @@ PASS  多图参考(2张): task_4yNjwlciXIna1Ql0A67wW1AHRdpD9gRz.mp4
 
 - 前端 `vue-tsc --noEmit` 通过（含新增的三种模式与多图状态）。
 - 提示词可用 `<Picture N>` 指代素材，前端会按已上传数量实时提示；后端在未检测到占位符时记一条 warning（不阻断）。
+
+---
+
+## 八、修复：切换页面丢失已生成/生成中的资源（v2.2.0）
+
+### 8.1 现象
+
+生成图片或视频后切换页面，结果消失；生成中的任务也随之丢失；并且**没有任何保存**。
+
+### 8.2 根因
+
+不是路由问题（导航是 `v-if`，整个过程没有调用 `reset()`，单次会话内 Pinia 状态本可保留），而是**持久化完全缺失**：
+
+| # | 根因 | 后果 |
+| --- | --- | --- |
+| 1 | 结果只存在 Pinia 内存里，没有 `localStorage` | 刷新、HMR 重载、任何重建 store 的动作都会清空 |
+| 2 | 后端**从不保存视频文件**，只返回 Agnes 的临时 URL + task_id | 一旦前端忘了 task_id，产物就再无入口 |
+| 3 | 生成中的任务没有记录 | 关页面/刷新后无法续查，任务变成"孤儿" |
+| 4 | 图片虽已落盘 `uploads/`，但没有任何索引 | 文件在，UI 里找不回来 |
+
+### 8.3 修复
+
+**后端**
+
+| 文件 | 改动 |
+| --- | --- |
+| `app/history.py`（新增） | `uploads/history.json` 记录每次生成：id / kind / 时间 / 状态 / prompt / 参数 / `local_url` / `remote_url`；线程锁 + 原子写；最多保留 200 条 |
+| `app/services/agnes_video.py` | 建单成功即写记录（含 `task_id`）；任务完成时把 mp4 下载到 `uploads/videos/<task_id>.mp4` 并回填 `local_url`；**自愈**：终态但无记录的任务自动补一条 |
+| `app/services/agnes_image.py` | 图片保存后写记录，响应返回 `record_id` |
+| `app/api/history.py`（新增） | `GET /api/history`、`GET /api/history/by-task/{task_id}`、`DELETE /api/history/{id}` |
+| `app/config.py` | `VIDEO_DIR`、`HISTORY_FILE`；`ensure_dirs()` 失败**只记录不抛异常** |
+
+**前端**
+
+| 文件 | 改动 |
+| --- | --- |
+| `lib/persist.ts`（新增） | localStorage 封装，命名空间 + 静默失败（隐私模式/配额不报错） |
+| `stores/videoStore.ts` | 建单即把 `taskId` 存入 localStorage；完成后存结果；`restore()` 恢复上次结果，**未完成任务自动续查**；`loadFromHistory()` |
+| `stores/imageStore.ts` | 完成后持久化结果，`restore()` 恢复 |
+| `views/HistoryView.vue`（新增） | "最近生成"页：图片/视频网格、筛选、内联播放、下载、删除 |
+| `App.vue` | 新增第三个导航；启动时调用两个 store 的 `restore()` |
+
+### 8.4 关键设计取舍
+
+1. **落盘优先于远程 URL**：完成后即把 mp4 下载到本地，播放优先用 `/uploads/videos/...` —— Agnes 的链接会过期，本地副本不会。
+2. **持久化是"尽力而为"**：`ensure_dirs()` 与 `history._write()` 都吞掉 `OSError` 并记 warning。
+   这点在测试中真实触发过——目录不可写时旧代码会让**整个应用启动失败**，现在只降级为"无历史"。
+3. **续查而非重跑**：恢复时若任务未完成，用原 `task_id` 继续轮询，不会重复计费。
+
+### 8.5 验证
+
+```text
+# 1) 旧任务（建于功能上线前）查询后自动落盘 + 自愈入历史
+GET /api/generate/task_dNIeD...  → local_url=/uploads/videos/task_dNIeD....mp4
+GET /uploads/videos/task_dNIeD....mp4 → 200 video/mp4, 1,177,704 B
+
+# 2) 新图片生成写入历史
+POST /api/image/generate → {"image_url":"/uploads/generated-a0de85b60bf0.png","record_id":"8b6e5d3dc408"}
+
+# 3) 历史列表（经前端 5173 代理）
+GET /api/history → count=2
+  [image] completed local=/uploads/generated-a0de85b60bf0.png
+  [video] completed local=/uploads/videos/task_dNIeD....mp4
+
+# 4) uploads/history.json 已生成（992 bytes）
+
+# 5) 前端编译
+App.vue / HistoryView.vue / videoStore.ts / api/history.ts / lib/persist.ts 均 200
+vue-tsc --noEmit 通过
+```
+
+### 8.6 遗留
+
+| 事项 | 说明 |
+| --- | --- |
+| 历史记录无分页 | 最多保留 200 条，超出按时间淘汰；量大后需要分页或迁移到数据库 |
+| 删除记录不删文件 | `DELETE /api/history/{id}` 只移除索引，`uploads/` 里的文件保留，需要时另做清理 |
+| 视频落盘占磁盘 | 每条视频约 0.3–3 MB，长期运行需定期清理 `uploads/videos` |

@@ -1,10 +1,23 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onMounted, ref } from "vue";
 import GenerateView from "./views/GenerateView.vue";
 import ImageGenerateView from "./views/ImageGenerateView.vue";
+import HistoryView from "./views/HistoryView.vue";
+import { useVideoStore } from "./stores/videoStore";
+import { useImageStore } from "./stores/imageStore";
 
-type ViewName = "video" | "image";
+type ViewName = "video" | "image" | "history";
 const currentView = ref<ViewName>("video");
+
+const videoStore = useVideoStore();
+const imageStore = useImageStore();
+
+// Restore the last results (and resume any unfinished video task) so switching
+// views or reloading never loses a generation.
+onMounted(() => {
+  videoStore.restore();
+  imageStore.restore();
+});
 
 const navItems: { key: ViewName; label: string; icon: string }[] = [
   {
@@ -16,6 +29,11 @@ const navItems: { key: ViewName; label: string; icon: string }[] = [
     key: "image",
     label: "图片生成",
     icon: "M3 3h18v18H3V3zM8 6a2 2 0 100 4 2 2 0 000-4zM21 15l-5-5L5 21",
+  },
+  {
+    key: "history",
+    label: "最近生成",
+    icon: "M12 8v4l3 2M3.05 11a9 9 0 1118 0 9 9 0 01-18 0z",
   },
 ];
 </script>
@@ -54,6 +72,7 @@ const navItems: { key: ViewName; label: string; icon: string }[] = [
       <main class="app-main">
         <GenerateView v-if="currentView === 'video'" />
         <ImageGenerateView v-else-if="currentView === 'image'" />
+        <HistoryView v-else />
       </main>
     </div>
   </div>

@@ -31,6 +31,7 @@ from app.config import (
     UPLOADS_DIR,
 )
 from app.schemas import ImageGenerateRequest, ImageGenerateResponse
+from app import history
 
 logger = logging.getLogger(__name__)
 
@@ -277,9 +278,22 @@ async def generate_image(req: ImageGenerateRequest) -> ImageGenerateResponse:
     else:
         raise HTTPException(status_code=500, detail="Agnes Image API returned no image URL or base64 data")
 
+    record = history.add_record(
+        "image",
+        prompt=req.prompt,
+        mode=req.mode.value,
+        model=IMAGE_MODEL,
+        size=req.size,
+        ratio=req.ratio,
+        status="completed",
+        local_url=local_url,
+        remote_url=image_url or None,
+    )
+
     return ImageGenerateResponse(
         image_url=local_url,
         revised_prompt=revised_prompt,
         size=req.size,
         ratio=req.ratio,
+        record_id=record["id"],
     )

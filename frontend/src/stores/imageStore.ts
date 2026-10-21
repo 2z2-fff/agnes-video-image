@@ -7,6 +7,18 @@ import {
   type ImageSize,
   type ImageTaskStatus,
 } from "../api/image";
+import { loadJSON, saveJSON, removeKey } from "../lib/persist";
+
+const STORAGE_KEY = "image.last";
+
+/** Shape persisted in localStorage so a reload keeps the last result. */
+interface PersistedImage {
+  imageUrl: string;
+  prompt: string;
+  size: ImageSize;
+  ratio: ImageRatio;
+  ts: number;
+}
 
 export const useImageStore = defineStore("image", () => {
   // ─── Form state ───────────────────────────────
@@ -92,6 +104,13 @@ export const useImageStore = defineStore("image", () => {
       // Add cache-busting query param to prevent stale image
       resultImageUrl.value = `${result.image_url}?t=${Date.now()}`;
       revisedPrompt.value = result.revised_prompt || "";
+      saveJSON(STORAGE_KEY, {
+        imageUrl: result.image_url,
+        prompt: prompt.value,
+        size: size.value,
+        ratio: ratio.value,
+        ts: Date.now(),
+      } satisfies PersistedImage);
     } catch (e) {
       taskStatus.value = "failed";
       error.value = e instanceof Error ? e.message : "未知错误";
@@ -100,12 +119,24 @@ export const useImageStore = defineStore("image", () => {
     }
   }
 
+  /** Restore the last generated image after a reload or view switch. */
+  function restore() {
+    const saved = loadJSON<PersistedImage>(STORAGE_KEY);
+    if (!saved?.imageUrl) return;
+    taskStatus.value = "complete";
+    resultImageUrl.value = `${saved.imageUrl}?t=${saved.ts}`;
+    size.value = saved.size;
+    ratio.value = saved.ratio;
+    if (saved.prompt) prompt.value = saved.prompt;
+  }
+
   function reset() {
     taskStatus.value = "idle";
     resultImageUrl.value = null;
     revisedPrompt.value = "";
     error.value = null;
     elapsedSec.value = 0;
+    removeKey(STORAGE_KEY);
   }
 
   return {
@@ -131,6 +162,7 @@ export const useImageStore = defineStore("image", () => {
     handleImageUpload,
     clearImage,
     generate,
+    restore,
     reset,
   };
 });

@@ -109,8 +109,12 @@ class TaskResponse(BaseModel):
     """Response for task status queries."""
 
     task_id: str
-    status: str = Field(..., description="queued | in_progress | completed | failed | timeout")
+    status: str = Field(..., description="queued | pending | in_progress | completed | failed | timeout")
     video_url: str | None = None
+    local_url: str | None = Field(
+        None,
+        description="/uploads/videos/... 本地副本，任务完成后由后端落盘，页面刷新后仍可用",
+    )
     duration: float | None = None
     progress: int | None = None
     error: str | None = None
@@ -171,3 +175,4 @@ class ImageGenerateResponse(BaseModel):
     revised_prompt: str = Field("", description="Revised prompt from the API, if any")
     size: str = Field("", description="Requested size tier")
     ratio: str = Field("", description="Requested aspect ratio")
+    record_id: str = Field("", description="History record id for this generation")

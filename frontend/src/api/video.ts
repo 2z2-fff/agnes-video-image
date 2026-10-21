@@ -27,6 +27,8 @@ export interface TaskResult {
   task_id: string;
   status: TaskStatus;
   video_url: string | null;
+  /** Backend-persisted copy (/uploads/videos/xxx.mp4); survives page reloads. */
+  local_url: string | null;
   duration: number | null;
   progress: number | null;
   error: string | null;

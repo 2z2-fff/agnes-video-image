@@ -100,4 +100,28 @@ CORS_ORIGINS = [
 UPLOADS_DIR = Path(
     os.getenv("UPLOADS_DIR") or (Path(__file__).parent.parent / "uploads")
 ).resolve()
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Generated videos are downloaded here so results outlive Agnes' temporary URLs.
+VIDEO_DIR = UPLOADS_DIR / "videos"
+
+# Generation history (survives page reloads / restarts)
+HISTORY_FILE = UPLOADS_DIR / "history.json"
+MAX_HISTORY_RECORDS = 200
+
+
+def ensure_dirs() -> list[str]:
+    """Create the storage directories, returning the ones that failed.
+
+    Persistence is best-effort: a read-only volume must not stop the API from
+    starting, it only disables the local copy/history features.
+    """
+    failed: list[str] = []
+    for path in (UPLOADS_DIR, VIDEO_DIR):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            failed.append(f"{path}: {exc}")
+    return failed
+
+
+STORAGE_ERRORS = ensure_dirs()

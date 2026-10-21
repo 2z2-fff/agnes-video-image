@@ -11,6 +11,25 @@ import {
   type TaskStatus,
   type VideoSize,
 } from "../api/video";
+import { loadJSON, saveJSON, removeKey } from "../lib/persist";
+
+const STORAGE_KEY = "video.last";
+
+/** Shape persisted in localStorage so a reload keeps the last result. */
+interface PersistedVideo {
+  taskId: string | null;
+  status: TaskStatus;
+  videoUrl: string | null;
+  localUrl: string | null;
+  prompt: string;
+  mode: GenerateMode;
+  aspectRatio: AspectRatio;
+  seconds: number;
+  size: VideoSize;
+  error: string | null;
+  elapsedSec: number;
+  ts: number;
+}
 
 /** One uploaded reference image (reference mode). */
 export interface ReferenceImage {
@@ -58,6 +77,7 @@ export const useVideoStore = defineStore("video", () => {
   const taskStatus = ref<TaskStatus>("idle");
   const taskId = ref<string | null>(null);
   const videoUrl = ref<string | null>(null);
+  const localUrl = ref<string | null>(null); // /uploads/videos/... copy served by the backend
   const error = ref<string | null>(null);
   const elapsedSec = ref(0);
   const progress = ref(0);
@@ -198,6 +218,7 @@ export const useVideoStore = defineStore("video", () => {
     taskStatus.value = "queued";
     error.value = null;
     videoUrl.value = null;
+    localUrl.value = null;
     progress.value = 0;
     elapsedSec.value = 0;
     const startTime = Date.now();
@@ -225,13 +246,17 @@ export const useVideoStore = defineStore("video", () => {
 
       taskId.value = created.task_id;
       taskStatus.value = "in_progress";
+      // Persist the id immediately: a reload must not orphan a queued task.
+      persist();
 
       const result = await waitForTask(created.task_id, 900);
 
       if (result.status === "completed") {
         taskStatus.value = "completed";
         progress.value = 100;
-        videoUrl.value = getStreamUrl(created.task_id);
+        localUrl.value = result.local_url ?? null;
+        // Prefer the backend's local copy: it outlives Agnes' temporary URL.
+        videoUrl.value = result.local_url || getStreamUrl(created.task_id);
       } else if (result.status === "failed" || result.status === "timeout") {
         taskStatus.value = result.status;
         error.value = result.error || "生成失败，请重试";
@@ -241,16 +266,116 @@ export const useVideoStore = defineStore("video", () => {
       error.value = e instanceof Error ? e.message : "未知错误";
     } finally {
       clearInterval(timer);
+      persist();
     }
+  }
+
+  // ─── Persistence / resume ─────────────────────
+
+  /** Write the current task state to localStorage. */
+  function persist() {
+    if (!taskId.value && taskStatus.value === "idle") {
+      removeKey(STORAGE_KEY);
+      return;
+    }
+    saveJSON(STORAGE_KEY, {
+      taskId: taskId.value,
+      status: taskStatus.value,
+      videoUrl: videoUrl.value,
+      localUrl: localUrl.value,
+      prompt: prompt.value,
+      mode: mode.value,
+      aspectRatio: aspectRatio.value,
+      seconds: seconds.value,
+      size: size.value,
+      error: error.value,
+      elapsedSec: elapsedSec.value,
+      ts: Date.now(),
+    } satisfies PersistedVideo);
+  }
+
+  /** Restore the last result (or resume polling an unfinished task) on startup. */
+  async function restore() {
+    const saved = loadJSON<PersistedVideo>(STORAGE_KEY);
+    if (!saved || !saved.taskId) return;
+
+    taskId.value = saved.taskId;
+    prompt.value = saved.prompt ?? prompt.value;
+    mode.value = saved.mode ?? mode.value;
+    aspectRatio.value = saved.aspectRatio ?? aspectRatio.value;
+    seconds.value = saved.seconds ?? seconds.value;
+    size.value = saved.size ?? size.value;
+
+    if (saved.status === "completed" && (saved.localUrl || saved.videoUrl)) {
+      taskStatus.value = "completed";
+      progress.value = 100;
+      localUrl.value = saved.localUrl ?? null;
+      videoUrl.value = saved.localUrl || saved.videoUrl;
+      return;
+    }
+
+    if (saved.status === "failed" || saved.status === "timeout") {
+      taskStatus.value = saved.status;
+      error.value = saved.error ?? null;
+      return;
+    }
+
+    // Still queued/running when the page was closed → keep polling.
+    taskStatus.value = saved.status === "queued" ? "queued" : "in_progress";
+    resumePolling(saved.taskId);
+  }
+
+  /** Re-attach to a task that was running when the page was closed. */
+  async function resumePolling(id: string) {
+    const startTime = Date.now() - elapsedSec.value * 1000;
+    const timer = setInterval(() => {
+      elapsedSec.value = Math.floor((Date.now() - startTime) / 1000);
+    }, 1000);
+    try {
+      const result = await waitForTask(id, 900);
+      if (result.status === "completed") {
+        taskStatus.value = "completed";
+        progress.value = 100;
+        localUrl.value = result.local_url ?? null;
+        videoUrl.value = result.local_url || getStreamUrl(id);
+      } else if (result.status === "failed" || result.status === "timeout") {
+        taskStatus.value = result.status;
+        error.value = result.error || "生成失败，请重试";
+      }
+    } catch (e) {
+      // Keep the restored state; the user can retry the query.
+      error.value = e instanceof Error ? e.message : "恢复任务状态失败";
+    } finally {
+      clearInterval(timer);
+      persist();
+    }
+  }
+
+  /** Load a past generation from the history list into the result panel. */
+  function loadFromHistory(record: {
+    taskId: string;
+    videoUrl: string | null;
+    prompt?: string;
+  }) {
+    taskId.value = record.taskId;
+    taskStatus.value = "completed";
+    progress.value = 100;
+    localUrl.value = record.videoUrl?.startsWith("/uploads/") ? record.videoUrl : null;
+    videoUrl.value = record.videoUrl;
+    prompt.value = record.prompt ?? prompt.value;
+    error.value = null;
+    persist();
   }
 
   function reset() {
     taskStatus.value = "idle";
     taskId.value = null;
     videoUrl.value = null;
+    localUrl.value = null;
     error.value = null;
     elapsedSec.value = 0;
     progress.value = 0;
+    removeKey(STORAGE_KEY);
   }
 
   return {
@@ -279,6 +404,7 @@ export const useVideoStore = defineStore("video", () => {
     taskStatus,
     taskId,
     videoUrl,
+    localUrl,
     error,
     elapsedSec,
     progress,
@@ -301,6 +427,8 @@ export const useVideoStore = defineStore("video", () => {
     removeReferenceImage,
     clearReferences,
     generate,
+    restore,
+    loadFromHistory,
     reset,
   };
 });

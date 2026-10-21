@@ -82,7 +82,16 @@ npm run dev
 | GET | `/api/generate/{id}/wait` | 长轮询等待完成 |
 | GET | `/api/generate/{id}/stream` | 视频流代理（支持 Range） |
 | GET | `/api/generate/{id}/download` | 下载视频 |
+| GET | `/api/history` | 最近生成记录（切换页面/刷新后可恢复） |
+| DELETE | `/api/history/{id}` | 删除某条记录（文件保留） |
 | POST | `/api/image/generate` | 图片生成（`txt2img` / `img2img` / `cartoon`） |
+
+## 结果不会丢
+
+- 生成完成后，视频会被**自动下载到 `backend/uploads/videos/`**，图片保存在 `backend/uploads/`；
+- 每次生成都会写入 `backend/uploads/history.json`，前端在「最近生成」页可回看、播放、下载；
+- 前端把最近一次结果与**未完成任务**的 `task_id` 存在 localStorage，刷新或切换页面后自动恢复，
+  未完成的任务会用原 `task_id` **续查**（不会重复计费）。
 
 ## 测试
 
